@@ -99,8 +99,9 @@ export class DetailView {
       depth: true
     });
     this.renderer.setSize(window.innerWidth, window.innerHeight);
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2)); // Cap at 2x for performance
     this.renderer.shadowMap.enabled = false; // Disable shadows for better performance
+    this.renderer.info.autoReset = false; // Manual reset for better control
     this.container.appendChild(this.renderer.domElement);
 
     // Add lighting for reflections
@@ -139,128 +140,127 @@ export class DetailView {
   /**
    * Create T-shaped floor with glowing edges
    */
-  createTShapedFloor(accentColor) {
-    // Store original accent color for title
-    this.originalAccentColor = new THREE.Color(accentColor);
-    // Use amber yellow for floor elements (edges and arc)
-    this.accentColor = new THREE.Color(0xA66300); // Much darker amber yellow
+  createLollipopFloor(accentColor) {
+      // Store original accent color for title
+      this.originalAccentColor = new THREE.Color(accentColor);
+      // Use amber yellow for floor elements (edges and arc)
+      this.accentColor = new THREE.Color(0xA66300); // Much darker amber yellow
 
-    // Clear existing floor and edges with proper cleanup
-    if (this.floor) {
-      this.scene.remove(this.floor);
-      if (this.floor.geometry) this.floor.geometry.dispose();
-      if (this.floor.material) {
-        if (this.floor.material.map) this.floor.material.map.dispose();
-        this.floor.material.dispose();
-      }
-      this.floor = null;
-    }
-    
-    // Clear floor pieces array if it exists
-    if (this.floorPieces) {
-      this.floorPieces.forEach(piece => {
-        this.scene.remove(piece);
-        if (piece.geometry) piece.geometry.dispose();
-        if (piece.material) {
-          if (piece.material.map) piece.material.map.dispose();
-          piece.material.dispose();
+      // Clear existing floor and edges with proper cleanup
+      if (this.floor) {
+        this.scene.remove(this.floor);
+        if (this.floor.geometry) this.floor.geometry.dispose();
+        if (this.floor.material) {
+          if (this.floor.material.map) this.floor.material.map.dispose();
+          this.floor.material.dispose();
         }
+        this.floor = null;
+      }
+
+      // Clear floor pieces array if it exists
+      if (this.floorPieces) {
+        this.floorPieces.forEach(piece => {
+          this.scene.remove(piece);
+          if (piece.geometry) piece.geometry.dispose();
+          if (piece.material) {
+            if (piece.material.map) piece.material.map.dispose();
+            piece.material.dispose();
+          }
+        });
+        this.floorPieces = [];
+      }
+
+      this.edges.forEach(edge => {
+        this.scene.remove(edge);
+        if (edge.geometry) edge.geometry.dispose();
+        if (edge.material) edge.material.dispose();
       });
+      this.edges = [];
+
+      // Dimensions for lollipop layout
+      const mainCorridorWidth = 16;
+      const mainCorridorLength = 80;
+      const circleRadius = 50; // Increased from 35 to 50
+      const entranceExtension = 35;
+
+      const entranceBackZ = 10 + entranceExtension;
+      const entranceZ = 10;
+      const junctionZ = -mainCorridorLength + 10; // -70: Where corridor ends
+      // Position circle center so the top edge of circle touches corridor end
+      const circleCenter = { x: 0, z: junctionZ - circleRadius }; // Circle top edge at junction
+
+      // Create nebula texture for floor
+      const nebulaTexture = this.createNebulaTexture();
+
+      // Create lollipop-shaped floor with nebula texture
+      const floorMaterial = new THREE.MeshStandardMaterial({
+        map: nebulaTexture,
+        metalness: 0.3,
+        roughness: 0.4,
+        emissive: 0x4a2a6a,
+        emissiveIntensity: 0.3,
+        side: THREE.DoubleSide
+      });
+
+      // Initialize floor pieces array for cleanup
       this.floorPieces = [];
+
+      // Entrance extension floor - ONLY behind spawn point
+      const entranceFloor = new THREE.Mesh(
+        new THREE.PlaneGeometry(mainCorridorWidth, entranceExtension),
+        floorMaterial
+      );
+      entranceFloor.rotation.x = -Math.PI / 2;
+      entranceFloor.position.set(0, 0.1, (entranceBackZ + entranceZ) / 2);
+      entranceFloor.receiveShadow = true;
+      this.scene.add(entranceFloor);
+      this.floorPieces.push(entranceFloor);
+
+      // Main corridor floor - from entrance to junction (extended slightly to overlap with circle)
+      const floorOverlap = 1; // Overlap by 2 units to hide seam
+      const mainFloor = new THREE.Mesh(
+        new THREE.PlaneGeometry(mainCorridorWidth, mainCorridorLength + floorOverlap),
+        floorMaterial
+      );
+      mainFloor.rotation.x = -Math.PI / 2;
+      mainFloor.position.set(0, 0.1, (entranceZ + (junctionZ - floorOverlap)) / 2);
+      mainFloor.receiveShadow = true;
+      this.scene.add(mainFloor);
+      this.floorPieces.push(mainFloor);
+
+      // Circular floor - ring shape with hole in center (donut/annulus shape)
+      const innerHoleRadius = 20; // Inner hole radius - increased for larger hole
+      const circleFloor = new THREE.Mesh(
+        new THREE.RingGeometry(innerHoleRadius, circleRadius, 48), // Ring from inner to outer radius
+        floorMaterial
+      );
+      circleFloor.rotation.x = -Math.PI / 2;
+      circleFloor.position.set(circleCenter.x, 0.1, circleCenter.z);
+      circleFloor.receiveShadow = true;
+      this.scene.add(circleFloor);
+      this.floorPieces.push(circleFloor);
+
+      // Create glowing edges for lollipop perimeter (including inner hole edge)
+      this.createGlowingEdges(mainCorridorWidth, mainCorridorLength, circleRadius, innerHoleRadius, circleCenter, entranceExtension, entranceZ, junctionZ);
+
+      // Add memory orbs (12 corridor + 18 circle = 30 total)
+      this.createMemoryOrbs(mainCorridorWidth, mainCorridorLength, circleRadius, circleCenter, entranceZ, junctionZ);
+
+      // Add point lights at corners
+      this.addCornerLights(mainCorridorWidth, mainCorridorLength, circleRadius, circleCenter, entranceZ, junctionZ);
+
+      // Add glowing entrance arc
+      this.createEntranceArc(mainCorridorWidth, entranceZ);
+
+      // Add floating title at circle center
+      const bubbleName = this.portfolioData?.title || 'Memory';
+      const titleText = `${bubbleName}'s Memory Hall`;
+      this.createFloatingTitle(titleText, circleCenter.x, 25, circleCenter.z, this.originalAccentColor);
+
+      // Create hologram platform as part of the Memory Hall structure
+      this.createHologramPlatform(this.originalAccentColor);
     }
-    
-    this.edges.forEach(edge => {
-      this.scene.remove(edge);
-      if (edge.geometry) edge.geometry.dispose();
-      if (edge.material) edge.material.dispose();
-    });
-    this.edges = [];
 
-    // Dimensions
-    const mainCorridorWidth = 16;
-    const mainCorridorLength = 80;
-    const tBarWidth = 70;
-    const tBarLength = 12;
-    const tBarExtension = 0;
-    const entranceExtension = 35;
-    
-    const entranceBackZ = 10 + entranceExtension;
-    const entranceZ = 10;
-    const junctionZ = -mainCorridorLength + 10;
-    const tBarBackZ = junctionZ - tBarLength;
-
-    // Create nebula texture for floor
-    const nebulaTexture = this.createNebulaTexture();
-    
-    // Create T-shaped floor with nebula texture
-    const floorMaterial = new THREE.MeshStandardMaterial({
-      map: nebulaTexture,
-      metalness: 0.3,
-      roughness: 0.4,
-      emissive: 0x4a2a6a,
-      emissiveIntensity: 0.3,
-      side: THREE.DoubleSide
-    });
-
-    // Initialize floor pieces array for cleanup
-    this.floorPieces = [];
-
-    // Entrance extension floor - ONLY behind spawn point
-    const entranceFloor = new THREE.Mesh(
-      new THREE.PlaneGeometry(mainCorridorWidth, entranceExtension),
-      floorMaterial
-    );
-    entranceFloor.rotation.x = -Math.PI / 2;
-    entranceFloor.position.set(0, 0.1, (entranceBackZ + entranceZ) / 2);
-    entranceFloor.receiveShadow = true;
-    this.scene.add(entranceFloor);
-    this.floorPieces.push(entranceFloor);
-
-    // Main corridor floor - from entrance to junction
-    const mainFloor = new THREE.Mesh(
-      new THREE.PlaneGeometry(mainCorridorWidth, mainCorridorLength),
-      floorMaterial
-    );
-    mainFloor.rotation.x = -Math.PI / 2;
-    mainFloor.position.set(0, 0.1, (entranceZ + junctionZ) / 2);
-    mainFloor.receiveShadow = true;
-    this.scene.add(mainFloor);
-    this.floorPieces.push(mainFloor);
-
-    // T-bar floor - full width
-    const tBarFloor = new THREE.Mesh(
-      new THREE.PlaneGeometry(tBarWidth, tBarLength),
-      floorMaterial
-    );
-    tBarFloor.rotation.x = -Math.PI / 2;
-    tBarFloor.position.set(0, 0.1, junctionZ - tBarLength / 2);
-    tBarFloor.receiveShadow = true;
-    this.scene.add(tBarFloor);
-    this.floorPieces.push(tBarFloor);
-
-    // Create glowing edges - ONLY ON OUTSIDE
-    this.createGlowingEdges(mainCorridorWidth, mainCorridorLength, tBarWidth, tBarLength, entranceExtension, tBarExtension, entranceZ, junctionZ);
-
-    // Add memory orbs along the walls
-    this.createMemoryOrbs(mainCorridorWidth, mainCorridorLength, tBarWidth, tBarLength, entranceZ, junctionZ);
-
-    // Add point lights at corners
-    this.addCornerLights(mainCorridorWidth, mainCorridorLength, tBarWidth, tBarLength, entranceZ, junctionZ);
-    
-    // Add glowing entrance arc
-    this.createEntranceArc(mainCorridorWidth, entranceZ);
-    
-    // Exit door removed - orb 27 placed in that position instead
-    // this.createExitDoorAndTitle(mainCorridorWidth, mainCorridorLength, tBarWidth, tBarLength, junctionZ);
-    
-    // Add floating title at T-junction
-    const bubbleName = this.portfolioData?.title || 'Memory';
-    const titleText = `${bubbleName}'s Memory Hall`;
-    this.createFloatingTitle(titleText, 0, 25, junctionZ - tBarLength - 4 + 10, this.originalAccentColor);
-    
-    // Create hologram platform as part of the Memory Hall structure
-    this.createHologramPlatform(this.originalAccentColor);
-  }
 
   /**
    * Create nebula/galaxy texture for floor - darker and seamless
@@ -369,9 +369,9 @@ export class DetailView {
   }
 
   /**
-   * Create glowing edges for the T-shaped floor with orb-style glow
+   * Create glowing edges for the lollipop-shaped floor with orb-style glow
    */
-  createGlowingEdges(mainWidth, mainLength, tBarWidth, tBarLength, entranceExtension, tBarExtension, entranceZ, junctionZ) {
+  createGlowingEdges(mainWidth, mainLength, circleRadius, innerHoleRadius, circleCenter, entranceExtension, entranceZ, junctionZ) {
     // Darker solid core
     const coreMaterial = new THREE.MeshBasicMaterial({
       color: 0xB87400, // Darker amber (about 25% darker)
@@ -395,17 +395,13 @@ export class DetailView {
     // Calculate key positions
     const mainHalfWidth = mainWidth / 2;
     const entranceBackZ = entranceZ + entranceExtension; // Back of entrance extension (where player spawns)
-    const tBarHalfWidth = tBarWidth / 2;
-    const tBarFrontZ = junctionZ;
-    const tBarBackZ = junctionZ - tBarLength;
-    const tBarExtendedBackZ = tBarBackZ - tBarExtension; // Extended back edge
 
     // Helper function to create edge with orb-style glow
     const createLightsaberEdge = (length, position, rotation) => {
-      // Solid core
+      // Solid core - reuse material
       const core = new THREE.Mesh(
-        new THREE.CylinderGeometry(coreRadius, coreRadius, length, 16),
-        coreMaterial.clone()
+        new THREE.CylinderGeometry(coreRadius, coreRadius, length, 8), // Reduced from 16 to 8
+        coreMaterial
       );
       core.position.copy(position);
       if (rotation.x) core.rotation.x = rotation.x;
@@ -413,21 +409,16 @@ export class DetailView {
       this.scene.add(core);
       this.edges.push(core);
 
-      // Outer glow
+      // Outer glow - reuse material
       const glow = new THREE.Mesh(
-        new THREE.CylinderGeometry(glowRadius, glowRadius, length, 16),
-        glowMaterial.clone()
+        new THREE.CylinderGeometry(glowRadius, glowRadius, length, 8), // Reduced from 16 to 8
+        glowMaterial
       );
       glow.position.copy(position);
       if (rotation.x) glow.rotation.x = rotation.x;
       if (rotation.z) glow.rotation.z = rotation.z;
       this.scene.add(glow);
       this.edges.push(glow);
-
-      // Softer point light matching orb intensity
-      const light = new THREE.PointLight(this.accentColor, 1.8, 10);
-      light.position.copy(position);
-      this.scene.add(light);
     };
 
     // === ENTRANCE EXTENSION EDGES (left and right sides) ===
@@ -464,45 +455,130 @@ export class DetailView {
       { x: Math.PI / 2 }
     );
 
-    // === T-BAR EDGES (extended width) ===
+    // === CONNECTING EDGES (from corridor to circle) ===
+    // Calculate where corridor edges meet the circle
+    // The circle's edge at x = ±mainHalfWidth intersects at a specific z position
+    const corridorHalfWidth = mainHalfWidth;
+    
+    // For a circle at (0, circleCenter.z) with radius circleRadius,
+    // find z where x = corridorHalfWidth
+    // Using circle equation: x² + (z - center.z)² = radius²
+    // (z - center.z)² = radius² - x²
+    // z = center.z + sqrt(radius² - x²)
+    
+    const tangentZ = circleCenter.z + Math.sqrt(circleRadius * circleRadius - corridorHalfWidth * corridorHalfWidth);
+    const connectLength = tangentZ - junctionZ;
+    
+    // Left connecting edge
     createLightsaberEdge(
-      tBarLength,
-      new THREE.Vector3(-tBarHalfWidth - coreRadius, edgeY, (tBarFrontZ + tBarBackZ) / 2),
+      connectLength,
+      new THREE.Vector3(-corridorHalfWidth - coreRadius, edgeY, (junctionZ + tangentZ) / 2),
       { x: Math.PI / 2 }
     );
     
+    // Right connecting edge
     createLightsaberEdge(
-      tBarLength,
-      new THREE.Vector3(tBarHalfWidth + coreRadius, edgeY, (tBarFrontZ + tBarBackZ) / 2),
+      connectLength,
+      new THREE.Vector3(corridorHalfWidth + coreRadius, edgeY, (junctionZ + tangentZ) / 2),
       { x: Math.PI / 2 }
-    );
-    
-    createLightsaberEdge(
-      tBarWidth + coreRadius * 2,
-      new THREE.Vector3(0, edgeY, tBarBackZ - coreRadius),
-      { z: Math.PI / 2 }
     );
 
-    // === T-BAR FRONT EDGES ===
-    const leftExtensionWidth = tBarHalfWidth - mainHalfWidth;
+    // === CIRCULAR EDGE (partial arc with gap for corridor connection) ===
+    // Create arc that wraps around, excluding the front section where corridor connects
+    // Calculate the angle where corridor edges (at x = ±mainHalfWidth) intersect the circle
+    const tangentAngle = Math.asin(mainHalfWidth / circleRadius); // Angle from +Z axis to tangent point
     
-    createLightsaberEdge(
-      leftExtensionWidth,
-      new THREE.Vector3(-mainHalfWidth - leftExtensionWidth / 2 - coreRadius * 2, edgeY, tBarFrontZ + coreRadius),
-      { z: Math.PI / 2 }
-    );
+    // Arc goes from left tangent, around the back, to right tangent
+    // In Three.js: 0° = +X, 90° = +Z (front)
+    const leftTangentAngle = Math.PI / 2 + tangentAngle; // Left side tangent
+    const rightTangentAngle = Math.PI / 2 - tangentAngle; // Right side tangent
     
-    createLightsaberEdge(
-      leftExtensionWidth,
-      new THREE.Vector3(mainHalfWidth + leftExtensionWidth / 2 + coreRadius * 2, edgeY, tBarFrontZ + coreRadius),
-      { z: Math.PI / 2 }
-    );
+    const arcStartAngle = leftTangentAngle; // Start from left tangent
+    const arcEndAngle = rightTangentAngle + Math.PI * 2; // End at right tangent (wrap around)
+    const totalSegments = 32;
+    const arcAngle = arcEndAngle - arcStartAngle;
+    const arcSegments = Math.floor(totalSegments * (arcAngle / (Math.PI * 2)));
+    const arcAngleStep = arcAngle / arcSegments;
+    
+    for (let i = 0; i < arcSegments; i++) {
+      const angle1 = (arcStartAngle + i * arcAngleStep) % (Math.PI * 2);
+      const angle2 = (arcStartAngle + (i + 1) * arcAngleStep) % (Math.PI * 2);
+      
+      const x1 = circleCenter.x + Math.cos(angle1) * circleRadius;
+      const z1 = circleCenter.z + Math.sin(angle1) * circleRadius;
+      const x2 = circleCenter.x + Math.cos(angle2) * circleRadius;
+      const z2 = circleCenter.z + Math.sin(angle2) * circleRadius;
+      
+      const segmentLength = Math.sqrt(Math.pow(x2 - x1, 2) + Math.pow(z2 - z1, 2));
+      // Calculate rotation to align segment tangent to circle
+      // Use midpoint angle for tangent direction
+      const midAngle = (angle1 + angle2) / 2;
+      const rotationY = midAngle;
+      
+      const core = new THREE.Mesh(
+        new THREE.CylinderGeometry(coreRadius, coreRadius, segmentLength, 8),
+        coreMaterial
+      );
+      core.position.set((x1 + x2) / 2, edgeY, (z1 + z2) / 2);
+      core.rotation.x = Math.PI / 2;
+      core.rotation.z = rotationY;
+      this.scene.add(core);
+      this.edges.push(core);
+
+      const glow = new THREE.Mesh(
+        new THREE.CylinderGeometry(glowRadius, glowRadius, segmentLength, 8),
+        glowMaterial
+      );
+      glow.position.set((x1 + x2) / 2, edgeY, (z1 + z2) / 2);
+      glow.rotation.x = Math.PI / 2;
+      glow.rotation.z = rotationY;
+      this.scene.add(glow);
+      this.edges.push(glow);
+    }
+
+    // === INNER CIRCULAR EDGE (complete circle for the hole) ===
+    const innerSegments = 24; // Fewer segments for smaller circle
+    const innerAngleStep = (Math.PI * 2) / innerSegments;
+    
+    for (let i = 0; i < innerSegments; i++) {
+      const angle1 = i * innerAngleStep;
+      const angle2 = (i + 1) * innerAngleStep;
+      
+      const x1 = circleCenter.x + Math.cos(angle1) * innerHoleRadius;
+      const z1 = circleCenter.z + Math.sin(angle1) * innerHoleRadius;
+      const x2 = circleCenter.x + Math.cos(angle2) * innerHoleRadius;
+      const z2 = circleCenter.z + Math.sin(angle2) * innerHoleRadius;
+      
+      const segmentLength = Math.sqrt(Math.pow(x2 - x1, 2) + Math.pow(z2 - z1, 2));
+      const midAngle = (angle1 + angle2) / 2;
+      const rotationY = midAngle;
+      
+      const core = new THREE.Mesh(
+        new THREE.CylinderGeometry(coreRadius, coreRadius, segmentLength, 8),
+        coreMaterial
+      );
+      core.position.set((x1 + x2) / 2, edgeY, (z1 + z2) / 2);
+      core.rotation.x = Math.PI / 2;
+      core.rotation.z = rotationY;
+      this.scene.add(core);
+      this.edges.push(core);
+
+      const glow = new THREE.Mesh(
+        new THREE.CylinderGeometry(glowRadius, glowRadius, segmentLength, 8),
+        glowMaterial
+      );
+      glow.position.set((x1 + x2) / 2, edgeY, (z1 + z2) / 2);
+      glow.rotation.x = Math.PI / 2;
+      glow.rotation.z = rotationY;
+      this.scene.add(glow);
+      this.edges.push(glow);
+    }
   }
 
   /**
    * Create floating memory orbs along the walls with main museum glassmorphism style
    */
-  createMemoryOrbs(mainWidth, mainLength, tBarWidth, tBarLength, entranceZ, junctionZ) {
+  createMemoryOrbs(mainWidth, mainLength, circleRadius, circleCenter, entranceZ, junctionZ) {
     // Clear existing orbs
     this.orbs.forEach(orb => {
       this.scene.remove(orb.mesh);
@@ -548,7 +624,7 @@ export class DetailView {
     });
     this.orbs = [];
 
-    const orbRadius = 2.5; // Medium size
+    const orbRadius = 3.0; // Increased size (was 2.5)
     const orbHeight = 4.5; // Raised higher
 
     // Amber yellow color for all orbs
@@ -557,9 +633,6 @@ export class DetailView {
     ];
 
     const mainHalfWidth = mainWidth / 2;
-    const tBarHalfWidth = tBarWidth / 2;
-    const tBarBackZ = junctionZ - tBarLength;
-    const tBarCenterZ = junctionZ - tBarLength / 2;
     
     // Get portfolio images if available
     const folder = this.portfolioData?.folder || null;
@@ -576,7 +649,7 @@ export class DetailView {
     let lastColorIndex = -1; // Track last color used to avoid repetition
 
     // Helper to create glassmorphism orb with portfolio image
-    const createOrb = (x, y, z, rotationY) => {
+    const createOrb = (x, y, z, rotationY, isRingOrb = false) => {
       // Select a color different from the last one
       let colorIndex;
       do {
@@ -1066,12 +1139,44 @@ export class DetailView {
 
       // Create text label below orb
       const caption = cardTitles[cardKey] || 'Memory';
-      const textSprite = this.createTextSprite(caption, colorData, rotationY);
       
-      // Position text forward from the orb (toward viewer)
-      const forwardOffset = 2.0; // Move 2 units forward
-      const textX = x + Math.sin(rotationY) * forwardOffset;
-      const textZ = z + Math.cos(rotationY) * forwardOffset;
+      // Calculate text rotation based on orb type
+      let textRotationY;
+      if (isRingOrb) {
+        // For ring orbs: calculate angle from orb to ring center
+        const dx = circleCenter.x - x;
+        const dz = circleCenter.z - z;
+        // Use atan2(dz, dx) to get angle, then convert to Y-axis rotation
+        // atan2 gives angle in XZ plane, we need to adjust for Three.js Y rotation
+        textRotationY = Math.atan2(dx, dz); // Swapped to get correct Y-axis rotation
+      } else {
+        // For corridor orbs: use the provided rotation
+        textRotationY = rotationY;
+      }
+      
+      const textSprite = this.createTextSprite(caption, colorData, textRotationY, isRingOrb, x, z, circleCenter.x, circleCenter.z);
+      
+      // Position text based on orb type
+      let textX, textZ;
+      if (isRingOrb) {
+        // Ring orb: position text between orb and ring center (inward)
+        const dirX = circleCenter.x - x;
+        const dirZ = circleCenter.z - z;
+        const length = Math.sqrt(dirX * dirX + dirZ * dirZ);
+        const normalizedDirX = dirX / length;
+        const normalizedDirZ = dirZ / length;
+        
+        // Move text 2 units toward the ring floor (inward)
+        const inwardOffset = 2.0;
+        textX = x + normalizedDirX * inwardOffset;
+        textZ = z + normalizedDirZ * inwardOffset;
+      } else {
+        // Corridor orb: position text forward toward viewer
+        const forwardOffset = 2.0;
+        textX = x + Math.sin(rotationY) * forwardOffset;
+        textZ = z + Math.cos(rotationY) * forwardOffset;
+      }
+      
       textSprite.position.set(textX, y - orbRadius - 1.0, textZ);
       this.scene.add(textSprite);
 
@@ -1092,75 +1197,75 @@ export class DetailView {
       });
     };
 
-    // Main corridor - Left wall (Orbs 1, 3, 5, 7, 9, 11) - equal spacing throughout
-    const leftX = -mainHalfWidth - 4.5; // Same distance as right wall
-    createOrb(leftX, orbHeight, 2, Math.PI / 2);    // Orb 1 (start)
-    createOrb(leftX, orbHeight, -10, Math.PI / 2);  // Orb 3 (12 units)
-    createOrb(leftX, orbHeight, -22, Math.PI / 2);  // Orb 5 (12 units)
-    createOrb(leftX, orbHeight, -34, Math.PI / 2);  // Orb 7 (12 units)
-    createOrb(leftX, orbHeight, -46, Math.PI / 2);  // Orb 9 (12 units)
-    createOrb(leftX, orbHeight, -56, Math.PI / 2);  // Orb 11 (10 units, then 12 to corner at -68)
+    // Main corridor - Left wall (Orbs 1, 3, 5, 7, 9, 11) - 6 orbs
+    const leftX = -mainHalfWidth - 4.5;
+    const corridorLength = entranceZ - junctionZ; // Total corridor length
+    
+    // First 5 orbs evenly spaced over most of corridor, last orb at junction
+    const availableLength = corridorLength - 15; // Reserve 15 units for last orb spacing
+    const firstFiveSpacing = availableLength / 5;
+    
+    createOrb(leftX, orbHeight, entranceZ - firstFiveSpacing, Math.PI / 2);      // Orb 1
+    createOrb(leftX, orbHeight, entranceZ - firstFiveSpacing * 2, Math.PI / 2);  // Orb 3
+    createOrb(leftX, orbHeight, entranceZ - firstFiveSpacing * 3, Math.PI / 2);  // Orb 5
+    createOrb(leftX, orbHeight, entranceZ - firstFiveSpacing * 4, Math.PI / 2);  // Orb 7
+    createOrb(leftX, orbHeight, entranceZ - firstFiveSpacing * 5, Math.PI / 2);  // Orb 9
+    createOrb(leftX, orbHeight, junctionZ + 2, Math.PI / 2);                     // Orb 11 - at junction edge
 
-    // Main corridor - Right wall (Orbs 2, 4, 6, 8, 10, 12) - equal spacing throughout
-    const rightX = mainHalfWidth + 4.5; // Moved further from wall
-    createOrb(rightX, orbHeight, 2, -Math.PI / 2);    // Orb 2 (start)
-    createOrb(rightX, orbHeight, -10, -Math.PI / 2);  // Orb 4 (12 units)
-    createOrb(rightX, orbHeight, -22, -Math.PI / 2);  // Orb 6 (12 units)
-    createOrb(rightX, orbHeight, -34, -Math.PI / 2);  // Orb 8 (12 units)
-    createOrb(rightX, orbHeight, -46, -Math.PI / 2);  // Orb 10 (12 units)
-    createOrb(rightX, orbHeight, -56, -Math.PI / 2);  // Orb 12 (10 units, then 12 to corner at -68)
+    // Main corridor - Right wall (Orbs 2, 4, 6, 8, 10, 12) - 6 orbs
+    const rightX = mainHalfWidth + 4.5;
+    createOrb(rightX, orbHeight, entranceZ - firstFiveSpacing, -Math.PI / 2);      // Orb 2
+    createOrb(rightX, orbHeight, entranceZ - firstFiveSpacing * 2, -Math.PI / 2);  // Orb 4
+    createOrb(rightX, orbHeight, entranceZ - firstFiveSpacing * 3, -Math.PI / 2);  // Orb 6
+    createOrb(rightX, orbHeight, entranceZ - firstFiveSpacing * 4, -Math.PI / 2);  // Orb 8
+    createOrb(rightX, orbHeight, entranceZ - firstFiveSpacing * 5, -Math.PI / 2);  // Orb 10
+    createOrb(rightX, orbHeight, junctionZ + 2, -Math.PI / 2);                     // Orb 12 - at junction edge
 
-    // T-bar dimensions for proper outside positioning
-    // Main corridor ends at Z=-70 (junctionZ), T-bar extends from Z=-70 to Z=-82
-    const tBarLeftX = -tBarHalfWidth - 4.5;   // Moved further from wall
-    const tBarRightX = tBarHalfWidth + 4.5;   // Moved further from wall
-    const tBarBackWallZ = tBarBackZ - 4.5;    // Moved further from wall
-    const tBarMiddleZ = (junctionZ + tBarBackZ) / 2;  // -76 (middle of T-bar)
-
-    // LEFT INNER CORNER (Orbs 13, 14, 15) - moved inward for spacing
-    createOrb(leftX, orbHeight, -65, Math.PI / 2);  // Orb 13 - aligned with left wall orbs, more space from corner
-    createOrb(-22, orbHeight, -65, Math.PI);        // Orb 14 - face toward back wall
-    createOrb(-30, orbHeight, -65, Math.PI);        // Orb 15 - face toward back wall
-
-    // LEFT SIDE WALL END (Orb 16) - revert to side facing
-    createOrb(tBarLeftX, orbHeight, tBarMiddleZ, Math.PI / 2);   // Orb 16 - face side wall
-
-    // BACK WALL CENTER (Orbs 17, 18, 19, 20, 21, 22, 27) - facing forward into hallway
-    createOrb(-30, orbHeight, tBarBackWallZ, 0);   // Orb 17 - face forward
-    createOrb(-18, orbHeight, tBarBackWallZ, 0);   // Orb 18 - face forward
-    createOrb(-8, orbHeight, tBarBackWallZ, 0);    // Orb 19 - face forward
-    createOrb(0, orbHeight, tBarBackWallZ, 0);     // Orb 27 - face forward (CENTER)
-    createOrb(8, orbHeight, tBarBackWallZ, 0);     // Orb 20 - face forward
-    createOrb(18, orbHeight, tBarBackWallZ, 0);    // Orb 21 - face forward
-    createOrb(30, orbHeight, tBarBackWallZ, 0);    // Orb 22 - face forward
-
-    // RIGHT INNER CORNER (Orbs 23, 24, 25) - moved inward for spacing
-    createOrb(rightX, orbHeight, -65, -Math.PI / 2);  // Orb 23 - aligned with right wall orbs, more space from corner
-    createOrb(22, orbHeight, -65, Math.PI);         // Orb 24 - face toward back wall
-    createOrb(30, orbHeight, -65, Math.PI);         // Orb 25 - face toward back wall
-
-    // RIGHT SIDE WALL END (Orb 26) - revert to side facing
-    createOrb(tBarRightX, orbHeight, tBarMiddleZ, -Math.PI / 2);  // Orb 26 - face side wall
+    // Circle orbs - exactly 18 orbs evenly distributed (Orbs 13-30)
+    // Exclude front section where corridor enters and distribute remaining orbs evenly
+    const orbDistance = circleRadius + 4.5; // Position orbs outside the circle edge
+    const circleOrbCount = 18;
+    
+    // The corridor enters from positive Z direction
+    // Adjust exclusion center to 97° to better align with actual corridor entrance
+    const corridorEntranceAngle = 98 * Math.PI / 180; // 97° (slightly offset from 90°)
+    const exclusionHalfAngle = 20 * Math.PI / 180; // ±20° exclusion
+    const excludedArc = exclusionHalfAngle * 2; // 40° total exclusion
+    
+    // Available arc for orbs (360° - 40° = 320°)
+    const availableArc = (Math.PI * 2) - excludedArc;
+    const angleStep = availableArc / circleOrbCount;
+    
+    // Start angle: after the exclusion zone (93° + 20° = 113°)
+    // This starts on the left side of the entrance
+    const startAngle = corridorEntranceAngle + exclusionHalfAngle;
+    
+    for (let i = 0; i < circleOrbCount; i++) {
+      const angle = startAngle + i * angleStep;
+      
+      const x = circleCenter.x + Math.cos(angle) * orbDistance;
+      const z = circleCenter.z + Math.sin(angle) * orbDistance;
+      
+      // Calculate rotation to face inward toward circle center
+      // For ring orbs, we want the text to face inward (toward ring floor)
+      // The angle points from center to orb, so angle + PI points from orb to center
+      const rotationY = angle + Math.PI;
+      
+      createOrb(x, orbHeight, z, rotationY, true); // true = isRingOrb
+    }
   }
 
   /**
    * Add corner lights
    */
-  addCornerLights(mainWidth, mainLength, tBarWidth, tBarLength, entranceZ, junctionZ) {
+  addCornerLights(mainWidth, mainLength, circleRadius, circleCenter, entranceZ, junctionZ) {
     const mainHalfWidth = mainWidth / 2;
     const mainStart = entranceZ;
-    const mainEnd = junctionZ;
-    const tBarHalfWidth = tBarWidth / 2;
-    const tBarZ = mainEnd + tBarLength / 2;
-    const tBarHalfLength = tBarLength / 2;
 
     const corners = [
       // Entrance corners
       { x: -mainHalfWidth, z: mainStart },
-      { x: mainHalfWidth, z: mainStart },
-      // T-bar outer corners
-      { x: -tBarHalfWidth, z: tBarZ - tBarHalfLength },
-      { x: tBarHalfWidth, z: tBarZ - tBarHalfLength }
+      { x: mainHalfWidth, z: mainStart }
     ];
 
     corners.forEach(corner => {
@@ -1168,12 +1273,26 @@ export class DetailView {
       light.position.set(corner.x, 2, corner.z);
       this.scene.add(light);
     });
+    
+    // Add perimeter lights around circular area
+    const perimeterLightCount = 4; // Reduced from 8 for better performance
+    const angleStep = (Math.PI * 2) / perimeterLightCount;
+    
+    for (let i = 0; i < perimeterLightCount; i++) {
+      const angle = i * angleStep;
+      const x = circleCenter.x + Math.cos(angle) * (circleRadius - 5);
+      const z = circleCenter.z + Math.sin(angle) * (circleRadius - 5);
+      
+      const light = new THREE.PointLight(this.accentColor, 2.5, 15);
+      light.position.set(x, 2, z);
+      this.scene.add(light);
+    }
   }
 
   /**
    * Create text sprite for orb captions
    */
-  createTextSprite(text, colorData, rotationY) {
+  createTextSprite(text, colorData, rotationY, isRingOrb = false, orbX = 0, orbZ = 0, centerX = 0, centerZ = 0) {
     const canvas = document.createElement('canvas');
     const context = canvas.getContext('2d');
     
@@ -1248,8 +1367,38 @@ export class DetailView {
     const geometry = new THREE.PlaneGeometry(planeWidth, planeHeight);
     const mesh = new THREE.Mesh(geometry, material);
     
-    // Rotate to face the hallway (toward center)
-    mesh.rotation.y = rotationY;
+    // Apply rotation
+    if (isRingOrb) {
+      // For ring orbs, determine flip based on position angle
+      const dx = orbX - centerX;
+      const dz = orbZ - centerZ;
+      
+      // Calculate the angle of the orb position from center
+      const posAngle = Math.atan2(dz, dx);
+      
+      // Normalize to 0-2PI
+      let normalizedPosAngle = posAngle;
+      while (normalizedPosAngle < 0) normalizedPosAngle += Math.PI * 2;
+      
+      // Convert to degrees for easier understanding
+      const degrees = normalizedPosAngle * 180 / Math.PI;
+      
+      // Back to original logic: flip only the 255-285 range
+      // But maybe the issue is the flip amount - try flipping by a different amount
+      if (degrees >= 260 && degrees <= 280) {
+        // These 2 orbs at the back - try no flip at all
+        mesh.rotation.y = rotationY;
+      } else if (degrees >= 255 && degrees <= 285) {
+        // Slightly wider range - normal flip
+        mesh.rotation.y = rotationY + Math.PI;
+      } else {
+        // All other orbs - normal
+        mesh.rotation.y = rotationY;
+      }
+    } else {
+      // Corridor orbs: use rotation as-is
+      mesh.rotation.y = rotationY;
+    }
     
     return mesh;
   }
@@ -1289,7 +1438,7 @@ export class DetailView {
     group.add(baseMesh);
     
     // Create particle system for rising particles in inverted cone shape
-    const particleCount = 30; // Reduced from 50 for better performance
+    const particleCount = 25; // Reduced for better performance
     const particles = [];
     
     // Create particle texture
@@ -2127,7 +2276,7 @@ export class DetailView {
     await new Promise(resolve => setTimeout(resolve, 800));
     loadingScreen.setProgress(30);
     
-    this.createTShapedFloor(accentColor);
+    this.createLollipopFloor(accentColor);
     loadingScreen.setProgress(70);
     
     await new Promise(resolve => setTimeout(resolve, 600));
@@ -2718,8 +2867,24 @@ export class DetailView {
     if (this.floor) {
       this.scene.remove(this.floor);
       if (this.floor.geometry) this.floor.geometry.dispose();
-      if (this.floor.material) this.floor.material.dispose();
+      if (this.floor.material) {
+        if (this.floor.material.map) this.floor.material.map.dispose();
+        this.floor.material.dispose();
+      }
       this.floor = null;
+    }
+    
+    // Remove floor pieces (lollipop layout components)
+    if (this.floorPieces) {
+      this.floorPieces.forEach(piece => {
+        this.scene.remove(piece);
+        if (piece.geometry) piece.geometry.dispose();
+        if (piece.material) {
+          if (piece.material.map) piece.material.map.dispose();
+          piece.material.dispose();
+        }
+      });
+      this.floorPieces = [];
     }
     
     // Remove welcome hologram and platform
@@ -4070,37 +4235,42 @@ export class DetailView {
   }
 
   /**
-   * Check if a position is within the T-shaped floor boundaries
+   * Check if a position is within the lollipop-shaped floor boundaries
+   * Floor layout:
+   * - Entrance extension: z from 10 to 45, width 16
+   * - Main corridor: z from -70 to 10, width 16
+   * - Circle center: at (0, -120)
+   * - Ring floor: outer radius 50, inner radius 20
    */
-  isInsideTShapedFloor(x, z, mainWidth, mainLength, tBarWidth, tBarLength, entranceExtension = 35) {
-    const mainHalfWidth = mainWidth / 2;
-    const entranceBackZ = 10 + entranceExtension;
-    const entranceZ = 10;
-    const junctionZ = -mainLength + 10;
-    const tBarHalfWidth = tBarWidth / 2;
-    const tBarBackZ = junctionZ - tBarLength;
-
-    // Check if in entrance extension
-    if (z >= entranceZ && z <= entranceBackZ) {
-      if (x >= -mainHalfWidth && x <= mainHalfWidth) {
-        return true;
-      }
+  isInsideLollipopFloor(x, z, mainWidth, mainLength, circleRadius, circleCenter, entranceExtension = 35, innerHoleRadius = 20) {
+    const halfWidth = mainWidth / 2;
+    
+    // Define z boundaries
+    const entranceBack = 10 + entranceExtension; // 45
+    const entranceFront = 10;
+    const corridorEnd = -mainLength + 10; // -70
+    
+    // 1. Entrance extension (z: 10 to 45, width: 16)
+    if (z >= entranceFront && z <= entranceBack && Math.abs(x) <= halfWidth) {
+      return true;
     }
-
-    // Check if in main corridor
-    if (z >= junctionZ && z <= entranceZ) {
-      if (x >= -mainHalfWidth && x <= mainHalfWidth) {
-        return true;
-      }
+    
+    // 2. Main corridor (z: -70 to 10, width: 16)
+    // Extend slightly into ring area for smooth transition
+    if (z >= corridorEnd - 10 && z <= entranceFront && Math.abs(x) <= halfWidth) {
+      return true;
     }
-
-    // Check if in T-bar
-    if (z >= tBarBackZ && z <= junctionZ) {
-      if (x >= -tBarHalfWidth && x <= tBarHalfWidth) {
-        return true;
-      }
+    
+    // 3. Ring floor (donut shape: outer radius 50, inner radius 20, center at (0, -120))
+    const dx = x - circleCenter.x;
+    const dz = z - circleCenter.z;
+    const distFromCenter = Math.sqrt(dx * dx + dz * dz);
+    
+    // Check if in ring area (between inner and outer radius)
+    if (distFromCenter >= innerHoleRadius && distFromCenter <= circleRadius) {
+      return true;
     }
-
+    
     return false;
   }
 
@@ -4149,27 +4319,28 @@ export class DetailView {
     const newX = prevX + this.cameraVelocity.x * deltaTime;
     const newZ = prevZ + this.cameraVelocity.z * deltaTime;
 
-    // T-shaped floor dimensions (must match createTShapedFloor)
+    // Lollipop floor dimensions (must match createLollipopFloor exactly)
     const mainCorridorWidth = 16;
     const mainCorridorLength = 80;
-    const tBarWidth = 60;
-    const tBarLength = 12;
-    const margin = 0.5; // Small margin from edges
+    const circleRadius = 50;
+    const innerHoleRadius = 20;
+    const entranceExtension = 35;
+    const circleCenter = { x: 0, z: -70 - 50 }; // z = -120
 
-    // Check if new position is inside T-shaped floor
-    if (this.isInsideTShapedFloor(newX, newZ, mainCorridorWidth - margin * 2, mainCorridorLength, tBarWidth - margin * 2, tBarLength)) {
+    // Check if new position is inside lollipop floor (no margin adjustments)
+    if (this.isInsideLollipopFloor(newX, newZ, mainCorridorWidth, mainCorridorLength, circleRadius, circleCenter, entranceExtension, innerHoleRadius)) {
       // Valid position - update camera
       this.camera.position.x = newX;
       this.camera.position.z = newZ;
     } else {
       // Hit boundary - try sliding along walls
       // Try X movement only
-      if (this.isInsideTShapedFloor(newX, prevZ, mainCorridorWidth - margin * 2, mainCorridorLength, tBarWidth - margin * 2, tBarLength)) {
+      if (this.isInsideLollipopFloor(newX, prevZ, mainCorridorWidth, mainCorridorLength, circleRadius, circleCenter, entranceExtension, innerHoleRadius)) {
         this.camera.position.x = newX;
         this.cameraVelocity.z = 0; // Stop Z velocity
       }
       // Try Z movement only
-      else if (this.isInsideTShapedFloor(prevX, newZ, mainCorridorWidth - margin * 2, mainCorridorLength, tBarWidth - margin * 2, tBarLength)) {
+      else if (this.isInsideLollipopFloor(prevX, newZ, mainCorridorWidth, mainCorridorLength, circleRadius, circleCenter, entranceExtension, innerHoleRadius)) {
         this.camera.position.z = newZ;
         this.cameraVelocity.x = 0; // Stop X velocity
       }
@@ -4296,12 +4467,15 @@ export class DetailView {
     
     const deltaTime = 0.016; // ~60fps
     this.time += deltaTime;
+    
+    // Cache frame counter (used multiple times)
+    const frameCount = Math.floor(this.time * 60);
 
     // Update camera controls
     this.updateCamera(deltaTime);
     
     // Update frustum for culling (only update every 3 frames for performance)
-    if (Math.floor(this.time * 60) % 3 === 0) {
+    if (frameCount % 3 === 0) {
       this.camera.updateMatrixWorld();
       this.cameraViewProjectionMatrix.multiplyMatrices(
         this.camera.projectionMatrix,
@@ -4311,8 +4485,8 @@ export class DetailView {
     }
 
     // Animate edge glow (skip door edges - they should be static)
-    // Optimize: Only update every other frame for edge glow
-    if (Math.floor(this.time * 60) % 2 === 0) {
+    // Optimize: Only update every 3 frames for edge glow (imperceptible due to sine wave)
+    if (frameCount % 3 === 0) {
       this.edges.forEach((edge, index) => {
         // Skip animation for door edges (they have additive blending)
         if (edge.material.blending === THREE.AdditiveBlending && edge.material.opacity > 0.8) {
@@ -4332,8 +4506,8 @@ export class DetailView {
       // Only animate visible orbs
       if (isVisible) {
         const offset = index * 0.3;
-        // More subtle floating motion for better performance (reduced from 0.4 to 0.2)
-        const floatY = orb.baseY + Math.sin(this.time * 1.5 + offset) * 0.2;
+        // Subtle floating motion
+        const floatY = orb.baseY + Math.sin(this.time * 1.5 + offset) * 0.15;
         orb.mesh.position.y = floatY;
         orb.glowRing.position.y = floatY;
         orb.light.position.y = floatY;
@@ -4341,7 +4515,7 @@ export class DetailView {
       }
       
       // Update video frame if present - optimize: only update every 3 frames (20fps for video) and cache gradients
-      if (isVisible && orb.videoElement && orb.videoElement.readyState >= orb.videoElement.HAVE_CURRENT_DATA && Math.floor(this.time * 60) % 3 === 0) {
+      if (isVisible && orb.videoElement && orb.videoElement.readyState >= orb.videoElement.HAVE_CURRENT_DATA && frameCount % 3 === 0) {
         // Draw current video frame to canvas with effects
         const canvas = orb.texture.image;
         const ctx = canvas.getContext('2d', { willReadFrequently: false, alpha: true });
@@ -4412,8 +4586,8 @@ export class DetailView {
         orb.texture.needsUpdate = true;
       }
       
-      // Animate platform particles
-      if (orb.platform && orb.platform.userData.particles) {
+      // Animate platform particles (only every 2 frames - imperceptible difference)
+      if (isVisible && frameCount % 2 === 0 && orb.platform && orb.platform.userData.particles) {
         orb.platform.userData.particles.forEach(particle => {
           // Move particle upward
           particle.position.y += particle.userData.velocity;
@@ -4537,6 +4711,11 @@ export class DetailView {
 
     // Render
     this.renderer.render(this.scene, this.camera);
+    
+    // Reset render info every 60 frames to prevent memory buildup
+    if (Math.floor(this.time * 60) % 60 === 0) {
+      this.renderer.info.reset();
+    }
   }
 
   /**
