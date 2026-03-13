@@ -68,9 +68,6 @@ export class DetailView {
     this.scene = new THREE.Scene();
     // Dark starry sky background
     this.scene.background = new THREE.Color(0x000510); // Very dark blue-black
-    
-    // Add starfield
-    this.createStarfield();
 
     // Create camera - position at entrance inside the T-shaped floor
     // Dynamic FOV based on aspect ratio to maintain consistent view
@@ -96,12 +93,14 @@ export class DetailView {
       antialias: true,
       powerPreference: 'high-performance',
       stencil: false,
-      depth: true
+      depth: true,
+      logarithmicDepthBuffer: false // Disable for better performance
     });
     this.renderer.setSize(window.innerWidth, window.innerHeight);
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2)); // Cap at 2x for performance
     this.renderer.shadowMap.enabled = false; // Disable shadows for better performance
     this.renderer.info.autoReset = false; // Manual reset for better control
+    this.renderer.sortObjects = true; // Enable object sorting for better batching
     this.container.appendChild(this.renderer.domElement);
 
     // Add lighting for reflections
@@ -177,15 +176,15 @@ export class DetailView {
       });
       this.edges = [];
 
-      // Dimensions for lollipop layout
+      // Dimensions for lollipop layout - increased for more spacious feel
       const mainCorridorWidth = 16;
-      const mainCorridorLength = 80;
-      const circleRadius = 50; // Increased from 35 to 50
+      const mainCorridorLength = 100; // Increased from 80 to 100
+      const circleRadius = 60; // Increased from 50 to 60
       const entranceExtension = 35;
 
       const entranceBackZ = 10 + entranceExtension;
       const entranceZ = 10;
-      const junctionZ = -mainCorridorLength + 10; // -70: Where corridor ends
+      const junctionZ = -mainCorridorLength + 10; // -90: Where corridor ends
       // Position circle center so the top edge of circle touches corridor end
       const circleCenter = { x: 0, z: junctionZ - circleRadius }; // Circle top edge at junction
 
@@ -259,6 +258,9 @@ export class DetailView {
 
       // Create hologram platform as part of the Memory Hall structure
       this.createHologramPlatform(this.originalAccentColor);
+      
+      // Create memory orb cube background
+      this.createStarfield();
     }
 
 
@@ -635,7 +637,7 @@ export class DetailView {
       { hex: 0x0066FF, rgb: [0, 102, 255] },     // Pure Blue
       { hex: 0x00FF66, rgb: [0, 255, 102] },     // Pure Green
       { hex: 0xFF0099, rgb: [255, 0, 153] },     // Pure Pink
-      { hex: 0xCE2029, rgb: [206, 32, 41] },     // Fire Engine Red
+      { hex: 0xF79C00, rgb: [247, 156, 0] },     // Amber Yellow (same as corridor)
       { hex: 0x9900FF, rgb: [153, 0, 255] }      // Pure Purple
     ];
 
@@ -649,7 +651,7 @@ export class DetailView {
       'placeholder1', 'placeholder2', 'placeholder3', 'placeholder4', 'placeholder5', 'placeholder6',
       'placeholder7', 'placeholder8', 'placeholder9', 'placeholder10', 'placeholder11', 'placeholder12',
       'placeholder13', 'placeholder14', 'placeholder15', 'placeholder16', 'placeholder17', 'placeholder18',
-      'placeholder19', 'placeholder20', 'placeholder21'
+      'placeholder19', 'placeholder20', 'placeholder21', 'placeholder22', 'placeholder23', 'placeholder24'
     ];
 
     let orbIndex = 0;
@@ -1194,7 +1196,8 @@ export class DetailView {
         textZ = z + Math.cos(rotationY) * forwardOffset;
       }
       
-      textSprite.position.set(textX, y - orbRadius - 1.0, textZ);
+      textSprite.position.set(textX, y - orbRadius - 0.5, textZ);
+      textSprite.renderOrder = 1; // Render after glow ring to prevent overlap
       this.scene.add(textSprite);
 
       this.orbs.push({ 
@@ -1207,6 +1210,7 @@ export class DetailView {
         texture: texture,
         baseY: y,
         color: colorData.hex,
+        colorData: colorData, // Store full color data for video frame updates
         cardKey: cardKey,
         caption: caption,
         slideshowInterval: slideshowInterval,
@@ -1218,8 +1222,8 @@ export class DetailView {
     const leftX = -mainHalfWidth - 4.5;
     const corridorLength = entranceZ - junctionZ; // Total corridor length
     
-    // First 5 orbs evenly spaced over most of corridor, last orb at junction
-    const availableLength = corridorLength - 15; // Reserve 15 units for last orb spacing
+    // Increased spacing between orbs for more spacious feel
+    const availableLength = corridorLength - 20; // Increased reserve from 15 to 20
     const firstFiveSpacing = availableLength / 5;
     
     createOrb(leftX, orbHeight, entranceZ - firstFiveSpacing, Math.PI / 2);      // Orb 1
@@ -1238,9 +1242,9 @@ export class DetailView {
     createOrb(rightX, orbHeight, entranceZ - firstFiveSpacing * 5, -Math.PI / 2);  // Orb 10
     createOrb(rightX, orbHeight, junctionZ + 2, -Math.PI / 2);                     // Orb 12 - at junction edge
 
-    // Circle orbs - exactly 18 orbs evenly distributed (Orbs 13-30)
+    // Circle orbs - 18 orbs with increased spacing around bigger ring
     // Exclude front section where corridor enters and distribute remaining orbs evenly
-    const orbDistance = circleRadius + 4.5; // Position orbs outside the circle edge
+    const orbDistance = circleRadius + 5.5; // Increased from 4.5 to 5.5 for bigger ring
     const circleOrbCount = 18;
     
     // The corridor enters from positive Z direction
@@ -1374,7 +1378,7 @@ export class DetailView {
       map: texture,
       transparent: true,
       side: THREE.DoubleSide,
-      depthTest: true
+      depthTest: true // Re-enable depth test to prevent seeing through orbs
     });
     
     // Calculate plane width based on canvas aspect ratio
@@ -1656,80 +1660,241 @@ export class DetailView {
   }
 
   /**
-   * Create starfield background
+   * Create memory orb cube background (Inside Out inspired)
+   * Optimized with instanced rendering and merged geometries
    */
   createStarfield() {
-    const starGeometry = new THREE.BufferGeometry();
-    const starCount = 2000;
-    const positions = new Float32Array(starCount * 3);
-    const colors = new Float32Array(starCount * 3);
-    const sizes = new Float32Array(starCount);
+    // Create memory orb cube background (Inside Out inspired)
+    // Optimized for performance with instanced rendering
     
-    // Create stars scattered in a large sphere around the scene
-    for (let i = 0; i < starCount; i++) {
-      const i3 = i * 3;
-      
-      // Random position in a large sphere
-      const radius = 200 + Math.random() * 300;
-      const theta = Math.random() * Math.PI * 2;
-      const phi = Math.random() * Math.PI;
-      
-      positions[i3] = radius * Math.sin(phi) * Math.cos(theta);
-      positions[i3 + 1] = radius * Math.sin(phi) * Math.sin(theta);
-      positions[i3 + 2] = radius * Math.cos(phi);
-      
-      // Star colors - mostly white with some blue/yellow tints
-      const colorVariation = Math.random();
-      if (colorVariation > 0.9) {
-        // Blue stars
-        colors[i3] = 0.7;
-        colors[i3 + 1] = 0.8;
-        colors[i3 + 2] = 1.0;
-      } else if (colorVariation > 0.8) {
-        // Yellow stars
-        colors[i3] = 1.0;
-        colors[i3 + 1] = 0.9;
-        colors[i3 + 2] = 0.7;
-      } else {
-        // White stars
-        colors[i3] = 1.0;
-        colors[i3 + 1] = 1.0;
-        colors[i3 + 2] = 1.0;
-      }
-      
-      // Random sizes
-      sizes[i] = Math.random() * 2 + 0.5;
-    }
+    const orbShelves = new THREE.Group();
     
-    starGeometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-    starGeometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-    starGeometry.setAttribute('size', new THREE.BufferAttribute(sizes, 1));
+    // Configuration for orb cube - optimized for performance
+    const cubeConfig = {
+      rows: 6,
+      cols: 10,
+      spacing: 40,
+      orbSize: 10,
+      width: 500,
+      height: 300,
+      depth: 600,
+      centerZ: -100
+    };
     
-    const starMaterial = new THREE.PointsMaterial({
-      size: 1.5,
-      vertexColors: true,
-      transparent: true,
-      opacity: 0.8,
-      sizeAttenuation: true,
-      blending: THREE.AdditiveBlending
+    // Array to store orb data
+    this.memoryOrbs = [];
+    
+    // Memory colors with variety
+    const memoryColors = [
+      { r: 255, g: 235, b: 100 },  // Bright yellow
+      { r: 255, g: 200, b: 50 },   // Golden yellow
+      { r: 140, g: 200, b: 255 },  // Light blue
+      { r: 80, g: 140, b: 255 },   // Deep blue
+      { r: 255, g: 140, b: 140 },  // Light red
+      { r: 255, g: 80, b: 80 },    // Bright red
+      { r: 230, g: 140, b: 255 },  // Light purple
+      { r: 180, g: 80, b: 255 },   // Deep purple
+      { r: 140, g: 255, b: 200 },  // Light green
+      { r: 80, g: 255, b: 140 },   // Bright green
+      { r: 255, g: 180, b: 230 },  // Pink
+      { r: 255, g: 140, b: 200 },  // Hot pink
+      { r: 180, g: 240, b: 255 },  // Cyan
+      { r: 200, g: 255, b: 180 },  // Lime
+      { r: 255, g: 200, b: 140 }   // Orange
+    ];
+    
+    // Pre-create textures for each color - simple solid circles
+    const textureCache = {};
+    memoryColors.forEach((color, index) => {
+      const orbCanvas = document.createElement('canvas');
+      orbCanvas.width = 64;
+      orbCanvas.height = 64;
+      const orbCtx = orbCanvas.getContext('2d');
+      
+      orbCtx.clearRect(0, 0, 64, 64);
+      
+      // Simple solid circle
+      orbCtx.fillStyle = `rgb(${color.r}, ${color.g}, ${color.b})`;
+      orbCtx.beginPath();
+      orbCtx.arc(32, 32, 30, 0, Math.PI * 2);
+      orbCtx.fill();
+      
+      const texture = new THREE.CanvasTexture(orbCanvas);
+      texture.needsUpdate = true;
+      textureCache[index] = texture;
     });
     
-    const stars = new THREE.Points(starGeometry, starMaterial);
-    this.scene.add(stars);
-    this.stars = stars;
+    // Create orbs using instanced rendering for better performance
+    const halfWidth = cubeConfig.width / 2;
+    const halfHeight = cubeConfig.height / 2;
+    const halfDepth = cubeConfig.depth / 2;
     
-    // Store twinkle data for animation
-    this.starTwinkleData = [];
-    for (let i = 0; i < starCount; i++) {
-      this.starTwinkleData.push({
-        baseOpacity: 0.5 + Math.random() * 0.5,
-        twinkleSpeed: 0.5 + Math.random() * 2,
-        twinkleOffset: Math.random() * Math.PI * 2
-      });
+    // Calculate total orb count
+    const leftWallCount = cubeConfig.rows * cubeConfig.cols;
+    const rightWallCount = cubeConfig.rows * cubeConfig.cols;
+    const backCols = Math.floor(cubeConfig.width / cubeConfig.spacing) - 2;
+    const backWallCount = cubeConfig.rows * backCols;
+    const totalOrbs = leftWallCount + rightWallCount + backWallCount;
+    
+    // Create one sprite per color for instancing
+    const orbsByColor = {};
+    memoryColors.forEach((color, index) => {
+      orbsByColor[index] = [];
+    });
+    
+    // Helper to add orb position
+    const addOrbPosition = (x, y, z) => {
+      const colorIndex = Math.floor(Math.random() * memoryColors.length);
+      orbsByColor[colorIndex].push({ x, y, z });
+    };
+    
+    // LEFT WALL
+    for (let row = 0; row < cubeConfig.rows; row++) {
+      for (let col = 0; col < cubeConfig.cols; col++) {
+        const y = (row - cubeConfig.rows / 2) * cubeConfig.spacing;
+        const z = cubeConfig.centerZ + halfDepth - (col * (cubeConfig.depth / (cubeConfig.cols - 1)));
+        addOrbPosition(-halfWidth + (Math.random() - 0.5) * 2, y, z);
+      }
     }
     
-    // Add glowing half moon
-    this.createMoon();
+    // RIGHT WALL
+    for (let row = 0; row < cubeConfig.rows; row++) {
+      for (let col = 0; col < cubeConfig.cols; col++) {
+        const y = (row - cubeConfig.rows / 2) * cubeConfig.spacing;
+        const z = cubeConfig.centerZ + halfDepth - (col * (cubeConfig.depth / (cubeConfig.cols - 1)));
+        addOrbPosition(halfWidth + (Math.random() - 0.5) * 2, y, z);
+      }
+    }
+    
+    // BACK WALL
+    for (let row = 0; row < cubeConfig.rows; row++) {
+      for (let col = 0; col < backCols; col++) {
+        const x = -halfWidth + (col * (cubeConfig.width / (backCols - 1)));
+        const y = (row - cubeConfig.rows / 2) * cubeConfig.spacing;
+        addOrbPosition(x, y, cubeConfig.centerZ - halfDepth + (Math.random() - 0.5) * 3);
+      }
+    }
+    
+    // Create sprites for each color group
+    Object.keys(orbsByColor).forEach(colorIndex => {
+      const positions = orbsByColor[colorIndex];
+      if (positions.length === 0) return;
+      
+      const texture = textureCache[colorIndex];
+      const material = new THREE.SpriteMaterial({
+        map: texture,
+        transparent: false,
+        blending: THREE.NormalBlending
+      });
+      
+      // Create individual sprites (Three.js doesn't support instanced sprites)
+      positions.forEach(pos => {
+        const sprite = new THREE.Sprite(material);
+        sprite.scale.set(cubeConfig.orbSize, cubeConfig.orbSize, 1);
+        sprite.position.set(pos.x, pos.y, pos.z);
+        sprite.frustumCulled = true; // Enable frustum culling
+        orbShelves.add(sprite);
+      });
+    });
+    
+    // Add shelf lines below each row of orbs
+    const shelfMaterial = new THREE.LineBasicMaterial({
+      color: 0xF79C00, // Brighter amber/yellow edge color
+      transparent: false,
+      opacity: 1.0,
+      linewidth: 2
+    });
+    
+    // Left wall shelves - stop exactly where rounded corner begins
+    const shelfCornerRadius = 60; // Increased for more rounded corners
+    for (let row = 0; row < cubeConfig.rows; row++) {
+      const rowY = (row - cubeConfig.rows / 2) * cubeConfig.spacing - 6;
+      const points = [];
+      
+      const cornerStartZ = cubeConfig.centerZ - halfDepth + shelfCornerRadius;
+      
+      // Add points from front to where corner starts
+      for (let col = 0; col <= cubeConfig.cols; col++) {
+        const colZ = cubeConfig.centerZ + halfDepth - (col * (cubeConfig.depth / cubeConfig.cols));
+        if (colZ >= cornerStartZ) {
+          points.push(new THREE.Vector3(-halfWidth, rowY, colZ));
+        }
+      }
+      
+      // Ensure we end exactly at corner start
+      if (points.length > 0 && points[points.length - 1].z > cornerStartZ) {
+        points.push(new THREE.Vector3(-halfWidth, rowY, cornerStartZ));
+      }
+      
+      const geometry = new THREE.BufferGeometry().setFromPoints(points);
+      const line = new THREE.Line(geometry, shelfMaterial);
+      orbShelves.add(line);
+    }
+    
+    // Right wall shelves - stop exactly where rounded corner begins
+    for (let row = 0; row < cubeConfig.rows; row++) {
+      const rowY = (row - cubeConfig.rows / 2) * cubeConfig.spacing - 6;
+      const points = [];
+      
+      const cornerStartZ = cubeConfig.centerZ - halfDepth + shelfCornerRadius;
+      
+      // Add points from front to where corner starts
+      for (let col = 0; col <= cubeConfig.cols; col++) {
+        const colZ = cubeConfig.centerZ + halfDepth - (col * (cubeConfig.depth / cubeConfig.cols));
+        if (colZ >= cornerStartZ) {
+          points.push(new THREE.Vector3(halfWidth, rowY, colZ));
+        }
+      }
+      
+      // Ensure we end exactly at corner start
+      if (points.length > 0 && points[points.length - 1].z > cornerStartZ) {
+        points.push(new THREE.Vector3(halfWidth, rowY, cornerStartZ));
+      }
+      
+      const geometry = new THREE.BufferGeometry().setFromPoints(points);
+      const line = new THREE.Line(geometry, shelfMaterial);
+      orbShelves.add(line);
+    }
+    
+    // Back wall shelves with rounded corners - optimized
+    const backShelfCols = Math.floor(cubeConfig.width / cubeConfig.spacing);
+    for (let row = 0; row < cubeConfig.rows; row++) {
+      const rowY = (row - cubeConfig.rows / 2) * cubeConfig.spacing - 6;
+      const points = [];
+      
+      // Left rounded corner - reduced steps for better performance
+      const cornerSteps = 10; // Reduced from 16 for performance
+      for (let step = 0; step <= cornerSteps; step++) {
+        const angle = (step / cornerSteps) * (Math.PI / 2);
+        const x = -halfWidth + shelfCornerRadius * (1 - Math.cos(angle));
+        const z = cubeConfig.centerZ - halfDepth + shelfCornerRadius * (1 - Math.sin(angle));
+        points.push(new THREE.Vector3(x, rowY, z));
+      }
+      
+      // Straight section across back wall - fewer points
+      const startX = -halfWidth + shelfCornerRadius;
+      const endX = halfWidth - shelfCornerRadius;
+      const backPoints = 6; // Fixed number for consistent performance
+      for (let i = 0; i <= backPoints; i++) {
+        const x = startX + (i / backPoints) * (endX - startX);
+        points.push(new THREE.Vector3(x, rowY, cubeConfig.centerZ - halfDepth));
+      }
+      
+      // Right rounded corner
+      for (let step = 0; step <= cornerSteps; step++) {
+        const angle = (step / cornerSteps) * (Math.PI / 2);
+        const x = halfWidth - shelfCornerRadius * (1 - Math.sin(angle));
+        const z = cubeConfig.centerZ - halfDepth + shelfCornerRadius * (1 - Math.cos(angle));
+        points.push(new THREE.Vector3(x, rowY, z));
+      }
+      
+      const geometry = new THREE.BufferGeometry().setFromPoints(points);
+      const line = new THREE.Line(geometry, shelfMaterial);
+      orbShelves.add(line);
+    }
+    
+    this.scene.add(orbShelves);
+    this.orbShelves = orbShelves;
   }
 
   /**
@@ -2112,8 +2277,19 @@ export class DetailView {
     // Clear canvas with transparency
     ctx.clearRect(0, 0, 2048, 512);
     
-    // Draw glowing text effect with larger font
-    ctx.font = 'bold 140px Arial';
+    // Dynamically adjust font size based on text length
+    let fontSize = 140;
+    ctx.font = `bold ${fontSize}px Arial`;
+    let textMetrics = ctx.measureText(text);
+    
+    // If text is too wide, reduce font size
+    const maxWidth = 1900; // Leave some padding
+    while (textMetrics.width > maxWidth && fontSize > 60) {
+      fontSize -= 5;
+      ctx.font = `bold ${fontSize}px Arial`;
+      textMetrics = ctx.measureText(text);
+    }
+    
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     
@@ -2144,11 +2320,11 @@ export class DetailView {
     const texture = new THREE.CanvasTexture(canvas);
     texture.needsUpdate = true;
     
-    // Create 3D depth effect by layering multiple planes
+    // Create 3D depth effect by layering multiple planes - reduced for performance
     const textWidth = 70; // Increased from 50
     const textHeight = 16; // Increased from 12
-    const depthLayers = 8; // Number of layers for 3D effect
-    const layerSpacing = 0.15; // Space between layers
+    const depthLayers = 4; // Reduced from 8 to 4 for better performance
+    const layerSpacing = 0.2; // Slightly increased spacing to maintain depth perception
     
     const textGroup = new THREE.Group();
     
@@ -3042,13 +3218,13 @@ export class DetailView {
     console.log('Folder:', folder);
     console.log('Card titles:', cardTitles);
     
-    // Create image cards (27 cards total - 6 main + 21 placeholders)
+    // Create image cards (30 cards total - 6 main + 24 placeholders)
     const cardKeys = [
       'overview', 'gallery', 'technologies', 'details', 'links', 'contact',
       'placeholder1', 'placeholder2', 'placeholder3', 'placeholder4', 'placeholder5', 'placeholder6',
       'placeholder7', 'placeholder8', 'placeholder9', 'placeholder10', 'placeholder11', 'placeholder12',
       'placeholder13', 'placeholder14', 'placeholder15', 'placeholder16', 'placeholder17', 'placeholder18',
-      'placeholder19', 'placeholder20', 'placeholder21'
+      'placeholder19', 'placeholder20', 'placeholder21', 'placeholder22', 'placeholder23', 'placeholder24'
     ];
     
     // Use direct index without modulo to ensure each orb uses its own folder
@@ -3781,6 +3957,11 @@ export class DetailView {
     console.log('=== showMediaModal called ===');
     console.log('Orb data:', orb);
     
+    // Get orb color for modal styling
+    const orbColorData = orb.colorData || { hex: 0xF79C00, rgb: [247, 156, 0] }; // Default to amber
+    const colorRgb = `${orbColorData.rgb[0]}, ${orbColorData.rgb[1]}, ${orbColorData.rgb[2]}`;
+    const colorHex = `#${orbColorData.hex.toString(16).padStart(6, '0')}`;
+    
     // Create modal overlay
     const modal = document.createElement('div');
     modal.style.cssText = `
@@ -3820,7 +4001,7 @@ export class DetailView {
       justify-content: center;
       background: rgba(0, 0, 0, 0.5);
       border-radius: 60px;
-      box-shadow: 0 0 50px rgba(255, 215, 0, 0.5);
+      box-shadow: 0 0 50px rgba(${colorRgb}, 0.5);
       overflow: hidden;
     `;
     
@@ -3849,7 +4030,7 @@ export class DetailView {
         height: auto;
         object-fit: contain;
         border-radius: 10px;
-        box-shadow: 0 0 50px rgba(255, 215, 0, 0.5);
+        box-shadow: 0 0 50px rgba(${colorRgb}, 0.5);
         background: rgba(0, 0, 0, 0.5);
       `;
       
@@ -3938,7 +4119,7 @@ export class DetailView {
       font-size: 1.5rem;
       font-weight: bold;
       text-align: center;
-      text-shadow: 0 0 10px rgba(255, 215, 0, 0.8);
+      text-shadow: 0 0 10px rgba(${colorRgb}, 0.8);
     `;
     
     // Create close button
@@ -3949,7 +4130,7 @@ export class DetailView {
       top: -60px;
       right: 0;
       background: rgba(255, 255, 255, 0.2);
-      border: 2px solid rgba(255, 215, 0, 0.5);
+      border: 2px solid rgba(${colorRgb}, 0.5);
       color: white;
       font-size: 2rem;
       width: 50px;
@@ -3963,7 +4144,7 @@ export class DetailView {
     `;
     
     closeBtn.addEventListener('mouseenter', () => {
-      closeBtn.style.background = 'rgba(255, 215, 0, 0.3)';
+      closeBtn.style.background = `rgba(${colorRgb}, 0.3)`;
       closeBtn.style.transform = 'scale(1.1)';
     });
     
@@ -3978,6 +4159,9 @@ export class DetailView {
         mediaElement.pause();
       }
       document.body.removeChild(modal);
+      // Resume animation loop
+      this.isActive = true;
+      this.animate();
     });
     
     // Navigation for multiple images
@@ -4010,25 +4194,25 @@ export class DetailView {
       prevButton.textContent = '← Previous';
       prevButton.style.cssText = `
         padding: 0.75rem 1.5rem;
-        background: rgba(255, 215, 0, 0.2);
-        border: 2px solid rgba(255, 215, 0, 0.5);
+        background: rgba(${colorRgb}, 0.2);
+        border: 2px solid rgba(${colorRgb}, 0.5);
         border-radius: 10px;
-        color: #FFD700;
+        color: ${colorHex};
         font-size: 1rem;
         font-weight: bold;
         cursor: pointer;
         transition: all 0.3s ease;
-        text-shadow: 0 0 10px rgba(255, 215, 0, 0.8);
+        text-shadow: 0 0 10px rgba(${colorRgb}, 0.8);
       `;
       
       // Counter
       const counterSpan = document.createElement('span');
       counterSpan.textContent = `1 / ${totalImages}`;
       counterSpan.style.cssText = `
-        color: #FFD700;
+        color: ${colorHex};
         font-size: 1.2rem;
         font-weight: bold;
-        text-shadow: 0 0 10px rgba(255, 215, 0, 0.8);
+        text-shadow: 0 0 10px rgba(${colorRgb}, 0.8);
         min-width: 100px;
         text-align: center;
       `;
@@ -4069,11 +4253,11 @@ export class DetailView {
       // Hover effects
       [prevButton, nextButton].forEach(btn => {
         btn.addEventListener('mouseenter', () => {
-          btn.style.background = 'rgba(255, 215, 0, 0.4)';
+          btn.style.background = `rgba(${colorRgb}, 0.4)`;
           btn.style.transform = 'scale(1.05)';
         });
         btn.addEventListener('mouseleave', () => {
-          btn.style.background = 'rgba(255, 215, 0, 0.2)';
+          btn.style.background = `rgba(${colorRgb}, 0.2)`;
           btn.style.transform = 'scale(1)';
         });
       });
@@ -4094,6 +4278,9 @@ export class DetailView {
           mediaElement.pause();
         }
         document.body.removeChild(modal);
+        // Resume animation loop
+        this.isActive = true;
+        this.animate();
       }
     });
     
@@ -4106,6 +4293,9 @@ export class DetailView {
         }
         document.body.removeChild(modal);
         document.removeEventListener('keydown', escapeHandler);
+        // Resume animation loop
+        this.isActive = true;
+        this.animate();
       }
     };
     document.addEventListener('keydown', escapeHandler);
@@ -4127,6 +4317,9 @@ export class DetailView {
     
     modal.appendChild(content);
     document.body.appendChild(modal);
+    
+    // Pause animation loop while modal is open for better performance
+    this.isActive = false;
   }
 
   /**
@@ -4237,11 +4430,12 @@ export class DetailView {
 
   /**
    * Check if a position is within the lollipop-shaped floor boundaries
-   * Floor layout:
+   * Floor layout (updated for expanded dimensions):
    * - Entrance extension: z from 10 to 45, width 16
-   * - Main corridor: z from -70 to 10, width 16
-   * - Circle center: at (0, -120)
-   * - Ring floor: outer radius 50, inner radius 20
+   * - Main corridor: z from -90 to 10, width 16 (25% longer)
+   * - Junction: at z = -90
+   * - Circle center: at (0, -150) (moved back 30 units)
+   * - Ring floor: outer radius 60 (20% bigger), inner radius 20
    */
   isInsideLollipopFloor(x, z, mainWidth, mainLength, circleRadius, circleCenter, entranceExtension = 35, innerHoleRadius = 20) {
     const halfWidth = mainWidth / 2;
@@ -4249,20 +4443,20 @@ export class DetailView {
     // Define z boundaries
     const entranceBack = 10 + entranceExtension; // 45
     const entranceFront = 10;
-    const corridorEnd = -mainLength + 10; // -70
+    const corridorEnd = -mainLength + 10; // -90 (updated from -70)
     
     // 1. Entrance extension (z: 10 to 45, width: 16)
     if (z >= entranceFront && z <= entranceBack && Math.abs(x) <= halfWidth) {
       return true;
     }
     
-    // 2. Main corridor (z: -70 to 10, width: 16)
+    // 2. Main corridor (z: -90 to 10, width: 16) - updated for longer corridor
     // Extend slightly into ring area for smooth transition
     if (z >= corridorEnd - 10 && z <= entranceFront && Math.abs(x) <= halfWidth) {
       return true;
     }
     
-    // 3. Ring floor (donut shape: outer radius 50, inner radius 20, center at (0, -120))
+    // 3. Ring floor (donut shape: outer radius 60, inner radius 20, center updated for bigger ring)
     const dx = x - circleCenter.x;
     const dz = z - circleCenter.z;
     const distFromCenter = Math.sqrt(dx * dx + dz * dz);
@@ -4322,11 +4516,11 @@ export class DetailView {
 
     // Lollipop floor dimensions (must match createLollipopFloor exactly)
     const mainCorridorWidth = 16;
-    const mainCorridorLength = 80;
-    const circleRadius = 50;
+    const mainCorridorLength = 100; // Updated: 80 → 100 (25% longer)
+    const circleRadius = 60; // Updated: 50 → 60 (20% bigger)
     const innerHoleRadius = 20;
     const entranceExtension = 35;
-    const circleCenter = { x: 0, z: -70 - 50 }; // z = -120
+    const circleCenter = { x: 0, z: -90 - 60 }; // z = -150 (updated for longer corridor and bigger ring)
 
     // Check if new position is inside lollipop floor (no margin adjustments)
     if (this.isInsideLollipopFloor(newX, newZ, mainCorridorWidth, mainCorridorLength, circleRadius, circleCenter, entranceExtension, innerHoleRadius)) {
@@ -4512,6 +4706,27 @@ export class DetailView {
       // Check if orb is in camera frustum
       const isVisible = this.frustum.intersectsObject(orb.mesh);
       
+      // Calculate distance from camera to orb for video playback control
+      const distance = this.camera.position.distanceTo(orb.mesh.position);
+      const videoPlayDistance = 50; // Play video only within 30 units
+      
+      // Control video playback based on distance
+      if (orb.videoElement) {
+        if (distance <= videoPlayDistance && isVisible) {
+          // Close enough and visible - play video
+          if (orb.videoElement.paused) {
+            orb.videoElement.play().catch(e => {
+              // Ignore autoplay errors
+            });
+          }
+        } else {
+          // Too far or not visible - pause video to save performance
+          if (!orb.videoElement.paused) {
+            orb.videoElement.pause();
+          }
+        }
+      }
+      
       // Only animate visible orbs
       if (isVisible) {
         const offset = index * 0.3;
@@ -4524,7 +4739,7 @@ export class DetailView {
       }
       
       // Update video frame if present - optimize: only update every 3 frames (20fps for video) and cache gradients
-      if (isVisible && orb.videoElement && orb.videoElement.readyState >= orb.videoElement.HAVE_CURRENT_DATA && frameCount % 3 === 0) {
+      if (isVisible && distance <= videoPlayDistance && orb.videoElement && orb.videoElement.readyState >= orb.videoElement.HAVE_CURRENT_DATA && frameCount % 3 === 0) {
         // Draw current video frame to canvas with effects
         const canvas = orb.texture.image;
         const ctx = canvas.getContext('2d', { willReadFrequently: false, alpha: true });
@@ -4561,8 +4776,9 @@ export class DetailView {
         // Draw video
         ctx.drawImage(orb.videoElement, drawX, drawY, drawWidth, drawHeight);
         
-        // Apply color overlay
-        ctx.fillStyle = 'rgba(247, 156, 0, 0.35)';
+        // Apply color overlay using orb's actual color
+        const colorData = orb.colorData;
+        ctx.fillStyle = `rgba(${colorData.rgb[0]}, ${colorData.rgb[1]}, ${colorData.rgb[2]}, 0.35)`;
         ctx.fillRect(0, 0, 512, 512);
         
         // Cache gradients if not already cached
@@ -4570,10 +4786,10 @@ export class DetailView {
           const vignette = ctx.createRadialGradient(256, 256, 0, 256, 256, 256);
           vignette.addColorStop(0, 'transparent');
           vignette.addColorStop(0.4, 'transparent');
-          vignette.addColorStop(0.6, 'rgba(247, 156, 0, 0.25)');
-          vignette.addColorStop(0.75, 'rgba(247, 156, 0, 0.6)');
-          vignette.addColorStop(0.88, 'rgba(247, 156, 0, 0.9)');
-          vignette.addColorStop(1, 'rgba(247, 156, 0, 1)');
+          vignette.addColorStop(0.6, `rgba(${colorData.rgb[0]}, ${colorData.rgb[1]}, ${colorData.rgb[2]}, 0.25)`);
+          vignette.addColorStop(0.75, `rgba(${colorData.rgb[0]}, ${colorData.rgb[1]}, ${colorData.rgb[2]}, 0.6)`);
+          vignette.addColorStop(0.88, `rgba(${colorData.rgb[0]}, ${colorData.rgb[1]}, ${colorData.rgb[2]}, 0.9)`);
+          vignette.addColorStop(1, `rgba(${colorData.rgb[0]}, ${colorData.rgb[1]}, ${colorData.rgb[2]}, 1)`);
           
           const highlight = ctx.createRadialGradient(154, 154, 0, 154, 154, 180);
           highlight.addColorStop(0, 'rgba(255, 255, 255, 0.3)');
@@ -4625,9 +4841,9 @@ export class DetailView {
       }
     });
 
-    // Animate floating title
+    // Animate floating title - subtle movement for performance
     if (this.titleSprite) {
-      const floatY = this.titleSprite.baseY + Math.sin(this.time * 1.2 + this.titleSprite.floatOffset) * 0.3;
+      const floatY = this.titleSprite.baseY + Math.sin(this.time * 0.5 + this.titleSprite.floatOffset) * 0.15;
       this.titleSprite.sprite.position.y = floatY;
       if (this.titleSprite.light) {
         this.titleSprite.light.position.y = floatY;
@@ -4640,20 +4856,8 @@ export class DetailView {
       }
     }
 
-    // Animate twinkling stars - more noticeable
-    if (this.stars && this.starTwinkleData) {
-      const colors = this.stars.geometry.attributes.color.array;
-      this.starTwinkleData.forEach((data, i) => {
-        // Larger variation: from 0.2 to 1.2 (60% variation instead of 30%)
-        const twinkle = Math.sin(this.time * data.twinkleSpeed + data.twinkleOffset) * 0.5 + 0.7;
-        const brightness = data.baseOpacity * twinkle;
-        const i3 = i * 3;
-        colors[i3] = brightness;
-        colors[i3 + 1] = brightness;
-        colors[i3 + 2] = brightness;
-      });
-      this.stars.geometry.attributes.color.needsUpdate = true;
-    }
+    // Animate memory orbs - removed pulsing for better performance
+    // Orbs are now static
 
     // Animate arc particles
     if (this.arcParticles) {
@@ -4889,12 +5093,26 @@ export class DetailView {
       this.doorParticles = null;
     }
     
-    // Cleanup stars
-    if (this.stars) {
-      this.scene.remove(this.stars);
-      if (this.stars.geometry) this.stars.geometry.dispose();
-      if (this.stars.material) this.stars.material.dispose();
-      this.stars = null;
+    // Cleanup memory orb shelves (sprites and lines)
+    if (this.orbShelves) {
+      this.orbShelves.traverse((child) => {
+        if (child instanceof THREE.Sprite) {
+          // Cleanup sprite
+          if (child.material) {
+            if (child.material.map) child.material.map.dispose();
+            child.material.dispose();
+          }
+        } else if (child instanceof THREE.Line) {
+          // Cleanup shelf lines
+          if (child.geometry) child.geometry.dispose();
+          if (child.material) child.material.dispose();
+        }
+      });
+      this.scene.remove(this.orbShelves);
+      this.orbShelves = null;
+    }
+    if (this.memoryOrbs) {
+      this.memoryOrbs = [];
     }
     
     // Cleanup moon
@@ -5012,10 +5230,6 @@ export class DetailView {
     document.removeEventListener('mousemove', this.onMouseMove);
     document.removeEventListener('mouseup', this.onMouseUp);
     window.removeEventListener('resize', this.onWindowResize);
-    
-    // Clear arrays and data
-    this.starTwinkleData = [];
-    this.originalStarColors = null;
     
     // Dispose renderer
     if (this.renderer) {

@@ -1762,9 +1762,19 @@ export default class MainMuseum {
       Math.pow(z - circleCenter.z, 2)
     );
     
-    // Only apply ring boundaries if in ring area
-    if (distFromCenter >= innerHoleRadius - 5 && distFromCenter <= circleRadius + 5) {
-      // Check if at an opening
+    // Only apply ring boundaries if actually in the ring walkway area
+    const inRingWalkway = distFromCenter >= innerHoleRadius - 5 && distFromCenter <= circleRadius + 5;
+    
+    if (inRingWalkway) {
+      // Inner boundary - always apply (prevent falling into hole)
+      if (distFromCenter < innerHoleRadius + margin) {
+        const angle = Math.atan2(z - circleCenter.z, x - circleCenter.x);
+        this.camera.position.x = circleCenter.x + Math.cos(angle) * (innerHoleRadius + margin);
+        this.camera.position.z = circleCenter.z + Math.sin(angle) * (innerHoleRadius + margin);
+        return;
+      }
+      
+      // Outer boundary - check if at an opening
       let atOpening = false;
       if (this.pathwayAngles) {
         const angle = Math.atan2(z - circleCenter.z, x - circleCenter.x);
@@ -1780,15 +1790,7 @@ export default class MainMuseum {
         }
       }
       
-      // Inner boundary - always apply
-      if (distFromCenter < innerHoleRadius + margin) {
-        const angle = Math.atan2(z - circleCenter.z, x - circleCenter.x);
-        this.camera.position.x = circleCenter.x + Math.cos(angle) * (innerHoleRadius + margin);
-        this.camera.position.z = circleCenter.z + Math.sin(angle) * (innerHoleRadius + margin);
-        return;
-      }
-      
-      // Outer boundary - only if not at opening
+      // Only apply outer boundary if NOT at an opening
       if (!atOpening && distFromCenter > circleRadius - margin) {
         const angle = Math.atan2(z - circleCenter.z, x - circleCenter.x);
         this.camera.position.x = circleCenter.x + Math.cos(angle) * (circleRadius - margin);
@@ -1797,7 +1799,7 @@ export default class MainMuseum {
       }
     }
     
-    // If we get here, we're in a valid area (pathway or beyond ring opening)
+    // If we get here, we're in a valid area (pathway, center area, or beyond ring opening)
     // Don't apply any constraints
   }
   
