@@ -139,7 +139,7 @@ const portfolioData = [
       placeholder21: "Calista OG",
       placeholder22: "Nanayyyy",
       placeholder23: "Mini me",
-      placeholder24: "Placeholder 24"
+      placeholder24: "Ngiting Tagumpay 😁"
     }
   },
   {
