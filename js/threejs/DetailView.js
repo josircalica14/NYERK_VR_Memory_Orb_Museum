@@ -4419,6 +4419,7 @@ export class DetailView {
         this.povHandBaseY = -1.2;
         this.povHandBaseX = 1.5;
         this.idleRotation = { x: 1.3, y: 3.4 + Math.PI, z: 4.7 };
+        this.walkRotation = { x: 1.3, y: 2.5 + Math.PI, z: 4.3 };
 
         if (gltf.animations && gltf.animations.length > 0) {
           this.handMixer = new THREE.AnimationMixer(hand);
@@ -4432,6 +4433,7 @@ export class DetailView {
           const skipBones = new Set(['GLOBAL_MAIN_CONTROL_R', 'GLOBAL_MAIN_CONTROL_R1', 'Root_joint_01', 'Root_joint_023', 'GLOBAL_cntrl', 'HANDPALM_cntrl']);
           this.idlePose = {};
           this.clickPose = {};
+          this.walkPose = {};
           hand.traverse(child => {
             if (child.isBone && !skipBones.has(child.name)) {
               this.idlePose[child.name] = child.quaternion.clone();
@@ -4446,6 +4448,17 @@ export class DetailView {
           hand.traverse(child => {
             if (child.isBone && !skipBones.has(child.name)) {
               this.clickPose[child.name] = child.quaternion.clone();
+            }
+          });
+
+          // Seek to walk pose (0.25) and snapshot
+          action.timeScale = 1;
+          this.handMixer.setTime(0);
+          this.handMixer.update(this.handClip.duration * 0.25);
+          action.timeScale = 0;
+          hand.traverse(child => {
+            if (child.isBone && !skipBones.has(child.name)) {
+              this.walkPose[child.name] = child.quaternion.clone();
             }
           });
 
@@ -5097,21 +5110,40 @@ export class DetailView {
         const bobY_dv = Math.sin(t) * 0.11 * this.bobStrength;
         this.povHand.position.y = this.povHandBaseY + bobY_dv;
         this.povHand.position.x = this.povHandBaseX + Math.sin(t * 0.5) * 0.055 * this.bobStrength;
-        this.povHand.rotation.z = (this.idleRotation ? this.idleRotation.z : this.povHand.rotation.z) + sway;
+
+        // Lerp pivot rotation between idle and walk rotation, add sway
+        if (this.idleRotation && this.walkRotation) {
+          this._walkLerpCurrent = this._walkLerpCurrent || 0;
+          const walkTarget = this.bobStrength > 0.05 ? 1 : 0;
+          this._walkLerpCurrent += (walkTarget - this._walkLerpCurrent) * 0.08;
+          const w = this._walkLerpCurrent;
+          this.povHand.rotation.x = this.idleRotation.x + (this.walkRotation.x - this.idleRotation.x) * w;
+          this.povHand.rotation.y = this.idleRotation.y + (this.walkRotation.y - this.idleRotation.y) * w;
+          this.povHand.rotation.z = this.idleRotation.z + (this.walkRotation.z - this.idleRotation.z) * w + sway;
+        }
 
         // Tick animation mixer for rigged hand
         if (this.handMixer) {
           this.handMixer.update(0.016);
         } else if (this.handRef && Object.keys(this.idlePose).length > 0) {
-          // Lerp bones between idle and click pose
+          // Click lerp (0=idle, 1=click)
           this._clickLerpCurrent += (this.clickAnimLerp - this._clickLerpCurrent) * 0.15;
 
           // Nudge hand forward and up on click
           this.povHand.position.z = -this._clickLerpCurrent * 0.3;
           this.povHand.position.y = this.povHandBaseY + bobY_dv + this._clickLerpCurrent * 0.15;
+
           this.handRef.traverse(child => {
-            if (child.isBone && this.idlePose[child.name] && this.clickPose[child.name]) {
-              child.quaternion.slerpQuaternions(this.idlePose[child.name], this.clickPose[child.name], this._clickLerpCurrent);
+            if (child.isBone && this.idlePose[child.name]) {
+              if (this._clickLerpCurrent > 0.01 && this.clickPose[child.name]) {
+                // Click takes priority
+                child.quaternion.slerpQuaternions(this.idlePose[child.name], this.clickPose[child.name], this._clickLerpCurrent);
+              } else if (this._walkLerpCurrent > 0.001 && this.walkPose[child.name]) {
+                // Walk pose — held steady
+                child.quaternion.slerpQuaternions(this.idlePose[child.name], this.walkPose[child.name], this._walkLerpCurrent);
+              } else {
+                child.quaternion.copy(this.idlePose[child.name]);
+              }
             }
           });
         } else {
@@ -5500,9 +5532,11 @@ export class DetailView {
     // Clear pose snapshots
     this.idlePose = {};
     this.clickPose = {};
+    this.walkPose = {};
     this._clickLerpCurrent = 0;
     this.clickAnimLerp = 0;
     this.idleRotation = null;
+    this.walkRotation = null;
 
     this.camera = null;
     this.isActive = false;
