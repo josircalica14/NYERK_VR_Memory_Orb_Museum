@@ -1920,7 +1920,7 @@ export default class MainMuseum {
 
     const loader = new GLTFLoader();
     loader.load(
-      '/robotic_hand/scene_embedded.gltf',
+      'robotic_hand/scene_embedded.gltf',
       (gltf) => {
         const hand = gltf.scene;
 
