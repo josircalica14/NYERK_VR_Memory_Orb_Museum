@@ -6,7 +6,14 @@
     <meta name="description" content="RetroWalk - Every step echoes a story. An interactive 3D portfolio museum experience">
     <meta name="author" content="Portfolio Owner">
     <title>RetroWalk</title>
-    <base href="/NYERK_VR_Memory_Orb_Museum/">
+    <script>
+      // Set base href only on GitHub Pages, not on localhost
+      if (location.hostname !== 'localhost' && location.hostname !== '127.0.0.1') {
+        const base = document.createElement('base');
+        base.href = '/NYERK_VR_Memory_Orb_Museum/';
+        document.head.appendChild(base);
+      }
+    </script>
     
     <!-- CSS Files -->
     <link rel="stylesheet" href="css/main.css">
