@@ -6,6 +6,7 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { LoadingScreen } from './LoadingScreen.js';
+import { ParticleField, attachAdaptiveResolution } from './PerfKit.js';
 
 export class DetailView {
   constructor() {
@@ -60,7 +61,6 @@ export class DetailView {
     this.onMouseDown = this.onMouseDown.bind(this);
     this.onMouseMove = this.onMouseMove.bind(this);
     this.onMouseUp = this.onMouseUp.bind(this);
-    this.onOrbClick = this.onOrbClick.bind(this);
   }
 
   /**
@@ -115,7 +115,8 @@ export class DetailView {
       logarithmicDepthBuffer: false // Disable for better performance
     });
     this.renderer.setSize(window.innerWidth, window.innerHeight);
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2)); // Cap at 2x for performance
+    // Full pixel ratio where the GPU keeps up; steps down only if frames drag.
+    this.adaptive = attachAdaptiveResolution(this.renderer);
     this.renderer.shadowMap.enabled = false; // Disable shadows for better performance
     this.renderer.info.autoReset = false; // Manual reset for better control
     this.renderer.sortObjects = true; // Enable object sorting for better batching
@@ -699,7 +700,23 @@ export class DetailView {
       
       // Get media path for this orb (try video first, then images for slideshow)
       const cardKey = cardKeys[currentOrbIndex] || `placeholder${currentOrbIndex + 1}`;
-      const videoPath = folder ? `assets/portfolios/${folder}/${cardKey}/1.mp4` : null;
+
+      // The generated manifest lists the real files for each card, so we stop
+      // guessing: each blind 1.mp4 probe used to cost a 404 per orb.
+      // A card missing from the manifest is a card with no media, not an
+      // unknown one - so it can skip probing entirely (the empty array path).
+      const folderManifest = folder && window.portfolioMedia ? window.portfolioMedia[folder] : null;
+      const cardMedia = folderManifest ? folderManifest[cardKey] || [] : null;
+      const isImageName = (name) => /\.(jpe?g|png|webp|gif|avif)$/i.test(name);
+      const isVideoName = (name) => /\.(mp4|webm|mov|m4v)$/i.test(name);
+      const manifestVideo = cardMedia ? cardMedia.find(isVideoName) : null;
+      const manifestImages = cardMedia ? cardMedia.filter(isImageName) : null;
+
+      const videoPath = folder
+        ? (cardMedia
+            ? (manifestVideo ? `assets/portfolios/${folder}/${cardKey}/${manifestVideo}` : null)
+            : `assets/portfolios/${folder}/${cardKey}/1.mp4`)
+        : null;
       
       // Create canvas for texture (used for images and as fallback)
       const canvas = document.createElement('canvas');
@@ -1002,46 +1019,80 @@ export class DetailView {
       // Helper to load multiple images (1.jpg, 2.jpg, 3.jpg, etc.)
       const loadSlideshowImages = async () => {
         const images = [];
-        let imageIndex = 1;
-        const maxImages = 20; // Try up to 20 images
-        
-        const loadImage = (index) => {
+
+        // Orb faces are 512px canvas textures, so the pre-built 320px preview
+        // looks the same up there while costing a fraction of the decode: the
+        // originals run up to 14 MB each. Full-size is still the fallback.
+        // Try a list of sources in order: the 512px orb face (1:1 with the
+        // texture, so nothing is upscaled), then the 320px UI preview, then the
+        // original file.
+        const loadOne = (sources) => {
           return new Promise((resolve) => {
-            const img = new Image();
-            img.crossOrigin = 'anonymous';
-            const imagePath = `assets/portfolios/${folder}/${cardKey}/${index}.jpg`;
-            
-            img.onload = () => {
-              images.push(img);
-              resolve(true);
+            const attempt = (index) => {
+              if (index >= sources.length) return resolve(false);
+
+              const img = new Image();
+              img.crossOrigin = 'anonymous';
+
+              img.onload = () => {
+                images.push(img);
+                resolve(true);
+              };
+
+              img.onerror = () => attempt(index + 1);
+
+              img.src = sources[index];
             };
-            
-            img.onerror = () => {
-              resolve(false);
-            };
-            
-            img.src = imagePath;
+
+            attempt(0);
           });
         };
-        
-        // Try loading images sequentially until one fails
-        for (let i = 1; i <= maxImages; i++) {
-          const loaded = await loadImage(i);
+
+        const sourcesFor = (name) => [
+          `assets/orbs/${folder}/${cardKey}/${name}`,
+          `assets/thumbs/${folder}/${cardKey}/${name}`,
+          `assets/portfolios/${folder}/${cardKey}/${name}`
+        ];
+
+        // Known files: load exactly those, in the order the manifest lists them.
+        if (manifestImages && manifestImages.length) {
+          for (const name of manifestImages) {
+            await loadOne(sourcesFor(name));
+          }
+          return images;
+        }
+        if (manifestImages) return images; // card exists but has no images
+
+        // No manifest entry: probe 1.jpg, 2.jpg, ... until one is missing.
+        for (let i = 1; i <= 20; i++) {
+          const loaded = await loadOne(sourcesFor(`${i}.jpg`));
           if (!loaded) break; // Stop when we hit a missing image
         }
-        
+
         return images;
       };
       
       // Try to load video first
+      let startVideo = null;
       if (videoPath) {
         videoElement = document.createElement('video');
-        videoElement.src = videoPath;
+        // src stays unset until the visitor is close: a hall holds up to 30
+        // orbs, and one of these files is 64 MB. Setting src would start the
+        // download immediately, on every server, regardless of preload.
         videoElement.crossOrigin = 'anonymous';
         videoElement.loop = true;
         videoElement.muted = true;
         videoElement.playsInline = true;
-        videoElement.preload = 'auto';
+        videoElement.preload = 'metadata';
+
+        // If no frame arrives quickly, show the designed gradient orb instead
+        // of an empty face until the visitor walks up to it.
+        window.setTimeout(() => {
+          if (!hasVideo) {
+            drawFallbackOrb(ctx, colorData);
+            texture.needsUpdate = true;
+          }
+        }, 1200);
         
         videoElement.addEventListener('loadeddata', () => {
           hasVideo = true;
@@ -1066,7 +1117,12 @@ export class DetailView {
           }
         });
         
-        videoElement.load();
+        // Called once, when the orb first comes within view distance.
+        startVideo = () => {
+          if (!videoElement || videoElement.src) return;
+          videoElement.src = videoPath;
+          videoElement.load();
+        };
       } else if (folder) {
         // No video, load slideshow images directly
         loadSlideshowImages().then(images => {
@@ -1225,6 +1281,8 @@ export class DetailView {
         platform: platform,
         textSprite: textSprite,
         videoElement: videoElement,
+        startVideo: startVideo,
+        videoStarted: false,
         texture: texture,
         baseY: y,
         color: colorData.hex,
@@ -1493,43 +1551,35 @@ export class DetailView {
     pCtx.fillRect(0, 0, 32, 32);
     
     const particleTexture = new THREE.CanvasTexture(particleCanvas);
-    const particleMaterial = new THREE.SpriteMaterial({
-      map: particleTexture,
-      transparent: true,
-      blending: THREE.AdditiveBlending,
-      depthWrite: false
-    });
-    
-    // Create particles
+
+    // One point cloud instead of 25 sprites: same particles, one draw call.
+    const field = new ParticleField(particleTexture, particleCount, { size: 0.18 });
+    field.texture = particleTexture;
+
+    const particleData = [];
     for (let i = 0; i < particleCount; i++) {
-      const particle = new THREE.Sprite(particleMaterial.clone());
-      
       // Random starting position in a circle on the floor
       const angle = Math.random() * Math.PI * 2;
       const radius = Math.random() * 0.5; // Start from center
-      
-      particle.position.x = Math.cos(angle) * radius;
-      particle.position.y = 0;
-      particle.position.z = Math.sin(angle) * radius;
-      
       const scale = 0.1 + Math.random() * 0.15;
-      particle.scale.set(scale, scale, 1);
-      
-      // Store particle data for animation
-      particle.userData = {
+
+      particleData.push({
         velocity: 0.02 + Math.random() * 0.03,
         maxHeight: 3 + Math.random() * 1,
         angle: angle,
         startRadius: radius,
-        resetY: 0
-      };
-      
-      group.add(particle);
-      particles.push(particle);
+        y: 0
+      });
+
+      field.setPosition(i, Math.cos(angle) * radius, 0, Math.sin(angle) * radius);
+      field.setSize(i, scale);
     }
-    
-    // Store particles array for animation
-    group.userData.particles = particles;
+    field.commit();
+    group.add(field.mesh);
+
+    // Store particle data for animation
+    group.userData.particles = field;
+    group.userData.particleData = particleData;
     group.userData.colorData = colorData;
     
     // Add central bright spot
@@ -3181,7 +3231,14 @@ export class DetailView {
     
     if (dragDistance < 5) { // Small threshold for click vs drag
       console.log('Click detected, checking orbs...');
-      this.checkOrbClick(event.clientX, event.clientY);
+      if (document.pointerLockElement) {
+        // Captured cursor: pick whatever the crosshair is on, not the frozen
+        // screen coordinate the browser reports.
+        const rect = this.renderer.domElement.getBoundingClientRect();
+        this.checkOrbClick(rect.left + rect.width / 2, rect.top + rect.height / 2);
+      } else {
+        this.checkOrbClick(event.clientX, event.clientY);
+      }
     }
   }
   
@@ -3235,1130 +3292,825 @@ export class DetailView {
    * Display content for clicked orb
    */
   showOrbContent(orbIndex) {
-    console.log('showOrbContent called with index:', orbIndex);
-    console.log('Portfolio data:', this.portfolioData);
-    
-    if (!this.portfolioData) return;
-    
-    // Get images from portfolio folder
-    const folder = this.portfolioData.folder || `portfolio-${this.portfolioData.id}`;
-    const cardTitles = this.portfolioData.cardTitles || {};
-    
-    console.log('Folder:', folder);
-    console.log('Card titles:', cardTitles);
-    
-    // Create image cards (30 cards total - 6 main + 24 placeholders)
-    const cardKeys = [
-      'overview', 'gallery', 'technologies', 'details', 'links', 'contact',
-      'placeholder1', 'placeholder2', 'placeholder3', 'placeholder4', 'placeholder5', 'placeholder6',
-      'placeholder7', 'placeholder8', 'placeholder9', 'placeholder10', 'placeholder11', 'placeholder12',
-      'placeholder13', 'placeholder14', 'placeholder15', 'placeholder16', 'placeholder17', 'placeholder18',
-      'placeholder19', 'placeholder20', 'placeholder21', 'placeholder22', 'placeholder23', 'placeholder24'
-    ];
-    
-    // Use direct index without modulo to ensure each orb uses its own folder
-    const cardKey = cardKeys[orbIndex] || `placeholder${orbIndex + 1}`;
-    const caption = cardTitles[cardKey] || 'Memory';
-    
-    // Try multiple file paths and extensions (video first, then images)
-    const possiblePaths = [
-      `assets/portfolios/${folder}/${cardKey}/1.mp4`,  // Try video first
-      `assets/portfolios/${folder}/${cardKey}/1.jpg`,  // Then jpg
-      `assets/portfolios/${folder}/${cardKey}/1.png`,  // Then png
-      `assets/portfolios/${folder}/${cardKey}.mp4`,    // Fallback video path
-      `assets/portfolios/${folder}/${cardKey}.jpg`,    // Fallback jpg path
-      `assets/portfolios/${folder}/${cardKey}.png`     // Fallback png path
-    ];
-    
-    console.log('Trying paths:', possiblePaths);
-    
-    // Try to load the first available media
-    this.tryLoadMedia(possiblePaths, caption, orbIndex);
+    // One viewer for every orb: the manifest-backed one, so multi-photo
+    // cards and clips open from their real file list.
+    const orb = this.orbs[orbIndex];
+    if (orb) this.showMediaModal(orb);
   }
   
   /**
-   * Try loading media from multiple possible paths
+   * Show a memory the way the hall shows it: the orb, opened. The memory is
+   * cropped into the orb's circle, dissolved into its colour at the rim, with
+   * the caption above and the controls beneath.
    */
-  tryLoadMedia(paths, caption, orbIndex, index = 0) {
-    if (index >= paths.length) {
-      console.log('No media found, showing fallback');
-      this.showImageCard(null, caption, orbIndex);
-      return;
-    }
-    
-    const path = paths[index];
-    const isVideo = path.endsWith('.mp4');
-    
-    if (isVideo) {
-      // Try loading video
-      const video = document.createElement('video');
-      video.preload = 'metadata';
-      
-      video.onloadedmetadata = () => {
-        console.log('Video loaded successfully:', path);
-        this.showImageCard(path, caption, orbIndex);
+  showMediaModal(orb) {
+    if (!orb || this._mediaModal) return;
+
+    this.injectMediaStyles();
+
+    const items = this.orbMediaItems(orb);
+    const caption = orb.caption || 'Memory';
+    const member = this.portfolioData?.title || 'Memory';
+    const accent = this.mediaAccent(orb);
+    const total = items.length;
+
+    const esc = (value) => String(value).replace(/[&<>"']/g, (ch) => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }[ch]));
+
+    const label = (item) => (item.isVideo ? 'Video' : 'Photo');
+
+    const overlay = document.createElement('div');
+    overlay.className = 'dv-orb';
+    overlay.tabIndex = -1;
+    overlay.setAttribute('role', 'dialog');
+    overlay.setAttribute('aria-modal', 'true');
+    overlay.setAttribute('aria-label', caption);
+    overlay.style.setProperty('--dv-accent', 'rgb(' + accent + ')');
+    overlay.style.setProperty('--dv-accent-rgb', accent);
+    // Light and rim use the orb's actual colour; only text uses the lifted one.
+    overlay.style.setProperty('--dv-accent-raw',
+      orb.colorData && orb.colorData.rgb ? orb.colorData.rgb.join(', ') : '247, 156, 0');
+
+    const chevronLeft = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5l-7 7 7 7"></path></svg>';
+    const chevronRight = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 5l7 7-7 7"></path></svg>';
+
+    const dots = items.map((item, index) =>
+      '<button type="button" class="dv-orb__dot" data-media-dot="' + index +
+      '" aria-label="' + label(item) + ' ' + (index + 1) + '"></button>'
+    ).join('');
+
+    overlay.innerHTML =
+      '<div class="dv-orb__stage">' +
+        '<div class="dv-orb__heading">' +
+          '<p class="dv-orb__eyebrow"><span class="dv-orb__spark"></span>' + esc(member) + '</p>' +
+          '<h2 class="dv-orb__title">' + esc(caption) + '</h2>' +
+          '<p class="dv-orb__meta" data-media-meta></p>' +
+        '</div>' +
+        '<div class="dv-orb__frame" data-media-frame data-state="loading">' +
+          '<div class="dv-orb__media" data-media-stage></div>' +
+          '<div class="dv-orb__vignette" aria-hidden="true"></div>' +
+          '<div class="dv-orb__glass" aria-hidden="true"></div>' +
+        '</div>' +
+        '<div class="dv-orb__foot">' +
+          (total > 1 ? '<div class="dv-orb__dots">' + dots + '</div>' : '') +
+          '<div class="dv-orb__actions">' +
+            '<button type="button" class="dv-orb__action" data-media-full>Full frame</button>' +
+            '<button type="button" class="dv-orb__action" data-media-close>Close</button>' +
+          '</div>' +
+        '</div>' +
+      '</div>' +
+      (total > 1
+        ? '<button type="button" class="dv-orb__step dv-orb__step--prev" data-media-step="-1" aria-label="Previous memory">' +
+            chevronLeft + '</button>' +
+          '<button type="button" class="dv-orb__step dv-orb__step--next" data-media-step="1" aria-label="Next memory">' +
+            chevronRight + '</button>'
+        : '');
+
+    const frame = overlay.querySelector('[data-media-frame]');
+    const stage = overlay.querySelector('[data-media-stage]');
+    const metaLine = overlay.querySelector('[data-media-meta]');
+    const dotEls = Array.from(overlay.querySelectorAll('[data-media-dot]'));
+    const prevBtn = overlay.querySelector('[data-media-step="-1"]');
+    const nextBtn = overlay.querySelector('[data-media-step="1"]');
+    const fullBtn = overlay.querySelector('[data-media-full]');
+
+    let current = 0;
+    let generation = 0;
+    let swipeStart = null;
+    let swipedAt = 0;
+    let isFull = false;
+    let isVideo = false;
+    let aspect = 1;
+
+    const errorCard = (title, body, item) =>
+      '<div class="dv-orb__notice">' +
+        '<p class="dv-orb__notice-title">' + esc(title) + '</p>' +
+        '<p class="dv-orb__notice-body">' + esc(body) + '</p>' +
+        (item ? '<a class="dv-orb__link" href="' + esc(item.src) + '" target="_blank" rel="noopener">' +
+          'Open original file</a>' : '') +
+      '</div>';
+
+    // The orb's circle is fixed; "full frame" grows it to the file's own shape
+    // so nothing stays cropped.
+    const applyFrame = () => {
+      frame.classList.toggle('is-full', isFull);
+      if (fullBtn) fullBtn.textContent = isFull ? 'Back to orb' : 'Full frame';
+
+      // Photos keep the orb's circle. Clips take their own rectangle, because
+      // their controls need corners and 'cover' would crop the footage.
+      if (!isFull && !isVideo) {
+        frame.style.width = '';
+        frame.style.height = '';
+        return;
+      }
+
+      const maxWidth = isFull
+        ? Math.min(window.innerWidth * 0.9, 1040)
+        : Math.min(window.innerWidth * 0.86, 740);
+      const maxHeight = isFull
+        ? window.innerHeight * 0.72
+        : Math.min(window.innerHeight * 0.6, 540);
+      let width = maxWidth;
+      let height = width / (aspect || 1);
+      if (height > maxHeight) {
+        height = maxHeight;
+        width = height * (aspect || 1);
+      }
+      frame.style.width = Math.round(width) + 'px';
+      frame.style.height = Math.round(height) + 'px';
+    };
+
+    const toggleFullFrame = () => {
+      if (isFull) {
+        isFull = false;
+        applyFrame();
+      } else {
+        isFull = true;
+        applyFrame();
+      }
+    };
+
+    const syncChrome = () => {
+      const item = items[current];
+      metaLine.textContent = label(item) + (total > 1 ? ' ' + (current + 1) + ' of ' + total : '');
+      if (prevBtn) prevBtn.disabled = current === 0;
+      if (nextBtn) nextBtn.disabled = current === total - 1;
+      dotEls.forEach((dot, index) => {
+        const active = index === current;
+        dot.classList.toggle('is-active', active);
+        if (active) dot.setAttribute('aria-current', 'true');
+        else dot.removeAttribute('aria-current');
+      });
+    };
+
+    const mount = () => {
+      const item = items[current];
+      const pass = ++generation;
+
+      const playing = stage.querySelector('video');
+      if (playing) playing.pause();
+
+      isVideo = item.isVideo;
+      isFull = false;
+      aspect = 1;
+
+      frame.dataset.state = 'loading';
+      frame.classList.toggle('is-video', isVideo);
+      stage.innerHTML = '';
+      applyFrame();
+      if (fullBtn) fullBtn.disabled = true;
+
+      const ready = () => {
+        if (pass !== generation) return;
+        frame.dataset.state = 'ready';
+        if (fullBtn) fullBtn.disabled = false;
       };
-      
-      video.onerror = () => {
-        console.log('Video failed to load, trying next:', path);
-        this.tryLoadMedia(paths, caption, orbIndex, index + 1);
+
+      const failed = () => {
+        if (pass !== generation) return;
+        frame.dataset.state = 'error';
+        stage.innerHTML = errorCard('This memory will not open',
+          'The file is on the list, but the browser could not read it.', item);
       };
-      
-      video.src = path;
-    } else {
-      // Try loading image
-      const img = new Image();
-      img.onload = () => {
-        console.log('Image loaded successfully:', path);
-        this.showImageCard(path, caption, orbIndex);
-      };
-      img.onerror = () => {
-        console.log('Image failed to load:', path);
-        this.tryLoadMedia(paths, caption, orbIndex, index + 1);
-      };
-      img.src = path;
-    }
-  }
-  
-  /**
-   * Show image card with circular styling
-   */
-  showImageCard(imagePath, caption, orbIndex = null) {
-    // Get the orb data if orbIndex is provided
-    const orb = orbIndex !== null ? this.orbs[orbIndex] : null;
-    const hasMultipleImages = orb && orb.slideshowImages && orb.slideshowImages.length > 1;
-    let currentImageIndex = 0;
-    
-    // Remove existing card
-    const existingCard = this.container.querySelector('.memory-card');
-    if (existingCard) existingCard.remove();
-    
-    // Check if this is a video or image path
-    const isVideo = imagePath && imagePath.endsWith('.mp4');
-    
-    // Pause Three.js animation for performance
-    if (this.animationFrameId) {
-      cancelAnimationFrame(this.animationFrameId);
-      this.animationFrameId = null;
-    }
-    
-    // Create backdrop with blur
-    const backdrop = document.createElement('div');
-    backdrop.className = 'modal-backdrop';
-    backdrop.style.cssText = `
-      position: fixed;
-      top: 0;
-      left: 0;
-      width: 100%;
-      height: 100%;
-      background: rgba(0, 0, 0, 0);
-      backdrop-filter: blur(0px);
-      -webkit-backdrop-filter: blur(0px);
-      z-index: 999;
-      transition: all 0.3s ease;
-    `;
-    this.container.appendChild(backdrop);
-    
-    // Trigger backdrop animation
-    setTimeout(() => {
-      backdrop.style.background = 'rgba(0, 0, 0, 0.7)';
-      backdrop.style.backdropFilter = 'blur(10px)';
-      backdrop.style.webkitBackdropFilter = 'blur(10px)';
-    }, 10);
-    
-    // Create circular card container styled like a zoomed memory orb
-    // Calculate responsive modal size that leaves room for controls
-    // Reserve space: 80px for caption above, 150px for controls below
-    const availableHeight = window.innerHeight - 230;
-    const availableWidth = window.innerWidth * 0.85;
-    
-    // Make it wider for videos to show more content
-    const modalSize = isVideo 
-      ? `min(${availableWidth}px, 800px)` 
-      : `min(${availableWidth}px, ${availableHeight}px, 600px)`;
-    const modalHeight = isVideo 
-      ? `min(${availableHeight * 0.7}px, 600px)` 
-      : `min(${availableWidth}px, ${availableHeight}px, 600px)`;
-    
-    const card = document.createElement('div');
-    card.className = 'memory-card';
-    card.style.cssText = `
-      position: fixed;
-      top: 50%;
-      left: 50%;
-      transform: translate(-50%, -50%) scale(0.8);
-      width: ${modalSize};
-      height: ${modalHeight};
-      background: rgba(255, 196, 1, 0.90);
-      border: 3px solid rgba(255, 196, 1, 0.8);
-      border-radius: ${isVideo ? '40px' : '50%'};
-      z-index: 1000;
-      display: flex;
-      flex-direction: column;
-      opacity: 0;
-      transition: all 0.3s ease;
-      align-items: center;
-      justify-content: center;
-      box-shadow: 
-        0 0 40px rgba(255, 196, 1, 0.7),
-        0 0 80px rgba(255, 196, 1, 0.5),
-        0 0 120px rgba(255, 196, 1, 0.3),
-        inset 0 0 60px rgba(255, 196, 1, 0.15);
-      padding: 0.2rem;
-      animation: modalPulse 3s ease-in-out infinite;
-      overflow: hidden;
-    `;
-    
-    // Store calculated size for later use
-    const calculatedSize = Math.min(availableWidth, availableHeight, 600);
-    
-    // Caption - positioned outside above the modal
-    const captionEl = document.createElement('h3');
-    captionEl.textContent = caption;
-    captionEl.style.cssText = `
-      color: #FFD700;
-      font-size: 1.8rem;
-      margin: 0;
-      text-align: center;
-      text-shadow: 0 0 10px rgba(255, 215, 0, 0.8);
-      position: fixed;
-      top: calc(50% - ${calculatedSize / 2}px - 60px);
-      left: 50%;
-      transform: translateX(-50%);
-      z-index: 1001;
-      opacity: 0;
-      transition: opacity 0.3s ease 0.1s;
-    `;
-    card.appendChild(captionEl);
-    
-    // Trigger animations after elements are added to DOM
-    setTimeout(() => {
-      card.style.opacity = '1';
-      card.style.transform = 'translate(-50%, -50%) scale(1)';
-      captionEl.style.opacity = '1';
-    }, 10);
-    
-    // Media container - fills entire modal
-    const mediaContainer = document.createElement('div');
-    mediaContainer.style.cssText = `
-      width: 100%;
-      height: 100%;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      position: relative;
-      border-radius: ${isVideo ? '40px' : '50%'};
-      overflow: hidden;
-    `;
-    
-    // Add media if path is provided
-    if (imagePath) {
+
       if (isVideo) {
         const video = document.createElement('video');
-        video.src = imagePath;
+        video.src = item.src;
         video.controls = true;
         video.autoplay = true;
         video.loop = true;
-        video.muted = false;
-        video.style.cssText = `
-          max-width: 100%;
-          max-height: 100%;
-          width: auto;
-          height: auto;
-          object-fit: contain;
-          object-position: center;
-        `;
-        
-        // Adjust modal size once video metadata is loaded
+        video.playsInline = true;
+        video.preload = 'metadata';
         video.addEventListener('loadedmetadata', () => {
-          const videoAspect = video.videoWidth / video.videoHeight;
-          const maxWidth = Math.min(window.innerWidth * 0.9, 1000);
-          const maxHeight = Math.min(window.innerHeight * 0.8, 700);
-          
-          let modalWidth, modalHeight;
-          
-          if (videoAspect > maxWidth / maxHeight) {
-            // Video is wider - fit to width
-            modalWidth = maxWidth;
-            modalHeight = maxWidth / videoAspect;
-          } else {
-            // Video is taller - fit to height
-            modalHeight = maxHeight;
-            modalWidth = maxHeight * videoAspect;
-          }
-          
-          // Update card dimensions
-          card.style.width = `${modalWidth}px`;
-          card.style.height = `${modalHeight}px`;
-          
-          // Update caption and button positions
-          captionEl.style.top = `calc(50% - ${modalHeight / 2}px - 60px)`;
-          if (hasMultipleImages) {
-            if (card.navContainer) {
-              card.navContainer.style.top = `calc(50% + ${modalHeight / 2}px + 30px)`;
-            }
-            closeBtn.style.top = `calc(50% + ${modalHeight / 2}px + 90px)`;
-          } else {
-            closeBtn.style.top = `calc(50% + ${modalHeight / 2}px + 30px)`;
-          }
+          aspect = video.videoWidth / Math.max(1, video.videoHeight);
+          ready();
+          applyFrame();
         });
-        
-        mediaContainer.appendChild(video);
-        
-        // Add colored vignette overlay on the video (amber) - rounded rectangle
-        const videoVignette = document.createElement('div');
-        videoVignette.style.cssText = `
-          position: absolute;
-          top: 0;
-          left: 0;
-          width: 100%;
-          height: 100%;
-          border-radius: 40px;
-          background: radial-gradient(
-            ellipse at center,
-            rgba(247, 156, 0, 0) 0%,
-            rgba(247, 156, 0, 0) 30%,
-            rgba(247, 156, 0, 0.1) 45%,
-            rgba(247, 156, 0, 0.2) 58%,
-            rgba(247, 156, 0, 0.35) 70%,
-            rgba(247, 156, 0, 0.5) 80%,
-            rgba(247, 156, 0, 0.7) 90%,
-            rgba(247, 156, 0, 0.85) 96%,
-            rgba(247, 156, 0, 1) 100%
-          );
-          pointer-events: none;
-          z-index: 1;
-        `;
-        mediaContainer.appendChild(videoVignette);
+        video.addEventListener('error', failed);
+        video.play().catch(() => ready());
+        stage.appendChild(video);
       } else {
-        const img = document.createElement('img');
-        img.src = imagePath;
+        const img = new Image();
         img.alt = caption;
-        img.style.cssText = `
-          width: 100%;
-          height: 100%;
-          object-fit: cover;
-          object-position: center;
-        `;
-        mediaContainer.appendChild(img);
-        
-        // Add colored vignette overlay on the image (amber) - intensified with solid outer edge
-        const imageVignette = document.createElement('div');
-        imageVignette.style.cssText = `
-          position: absolute;
-          top: 0;
-          left: 0;
-          width: 100%;
-          height: 100%;
-          border-radius: 50%;
-          background: radial-gradient(
-            circle at center,
-            rgba(255, 187, 1, 0) 0%,
-            rgba(255, 187, 1, 0) 15%,
-            rgba(255, 187, 1, 0.2) 30%,
-            rgba(255, 187, 1, 0.4) 42%,
-            rgba(255, 187, 1, 0.6) 54%,
-            rgba(255, 187, 1, 0.8) 68%,
-            rgba(255, 187, 1, 0.95) 80%,
-            rgba(255, 187, 1, 1) 90%,
-            rgba(255, 187, 1, 1) 100%
-          );
-          pointer-events: none;
-          z-index: 1;
-        `;
-        mediaContainer.appendChild(imageVignette);
+        img.decoding = 'async';
+        img.addEventListener('load', () => {
+          aspect = img.naturalWidth / Math.max(1, img.naturalHeight);
+          ready();
+          applyFrame();
+        });
+        img.addEventListener('error', failed);
+        img.src = item.src;
+        stage.appendChild(img);
+        if (img.complete && img.naturalWidth) {
+          aspect = img.naturalWidth / Math.max(1, img.naturalHeight);
+          ready();
+        }
       }
-    }
-    
-    card.appendChild(mediaContainer);
-    
-    // Full view toggle button and navigation - positioned outside above close button
-    let isFullView = false;
-    
-    // Create full view toggle button (for images only, not videos)
-    let fullViewBtn = null;
-    if (!isVideo) {
-      fullViewBtn = document.createElement('button');
-      fullViewBtn.textContent = '🔍 Full View';
-      fullViewBtn.style.cssText = `
-        padding: 0.6rem 1.2rem;
-        background: rgba(255, 215, 0, 0.2);
-        border: 2px solid rgba(255, 215, 0, 0.5);
-        border-radius: 20px;
-        color: #FFD700;
-        cursor: pointer;
-        font-size: 1rem;
-        font-weight: bold;
-        transition: all 0.3s ease;
-        box-shadow: 0 0 10px rgba(255, 215, 0, 0.3);
-        white-space: nowrap;
-      `;
-      
-      fullViewBtn.addEventListener('mouseenter', () => {
-        fullViewBtn.style.background = 'rgba(255, 215, 0, 0.4)';
-        fullViewBtn.style.boxShadow = '0 0 20px rgba(255, 215, 0, 0.6)';
-        fullViewBtn.style.transform = 'scale(1.05)';
-      });
-      
-      fullViewBtn.addEventListener('mouseleave', () => {
-        fullViewBtn.style.background = 'rgba(255, 215, 0, 0.2)';
-        fullViewBtn.style.boxShadow = '0 0 10px rgba(255, 215, 0, 0.3)';
-        fullViewBtn.style.transform = 'scale(1)';
-      });
-      
-      fullViewBtn.addEventListener('click', (e) => {
-        e.stopPropagation();
-        isFullView = !isFullView;
-        
-        const imgElement = mediaContainer.querySelector('img');
-        const vignette = mediaContainer.querySelector('div');
-        
-        if (isFullView) {
-          // Full view - resize modal to fit original image dimensions
-          if (imgElement && imgElement.naturalWidth && imgElement.naturalHeight) {
-            const imgAspect = imgElement.naturalWidth / imgElement.naturalHeight;
-            
-            // Reserve more space for caption (80px above) and controls (180px below for nav + close button)
-            const reservedVerticalSpace = 280;
-            const maxWidth = Math.min(window.innerWidth * 0.7, imgElement.naturalWidth);
-            const maxHeight = Math.min(window.innerHeight - reservedVerticalSpace, imgElement.naturalHeight);
-            
-            let modalWidth, modalHeight;
-            
-            // Calculate dimensions to fit image while respecting max constraints
-            if (imgElement.naturalWidth > maxWidth || imgElement.naturalHeight > maxHeight) {
-              // Image is larger than max constraints, scale it down
-              if (imgAspect > maxWidth / maxHeight) {
-                modalWidth = maxWidth;
-                modalHeight = maxWidth / imgAspect;
-              } else {
-                modalHeight = maxHeight;
-                modalWidth = maxHeight * imgAspect;
-              }
-            } else {
-              // Image fits within constraints, use natural size
-              modalWidth = imgElement.naturalWidth;
-              modalHeight = imgElement.naturalHeight;
-            }
-            
-            // Update card dimensions with transition
-            card.style.transition = 'all 0.4s ease';
-            card.style.width = `${modalWidth}px`;
-            card.style.height = `${modalHeight}px`;
-            card.style.borderRadius = '40px';
-            
-            mediaContainer.style.borderRadius = '40px';
-            if (vignette) vignette.style.borderRadius = '40px';
-            if (imgElement) {
-              imgElement.style.objectFit = 'contain';
-              imgElement.style.borderRadius = '40px';
-            }
-            
-            // Update caption position
-            captionEl.style.transition = 'all 0.4s ease';
-            captionEl.style.top = `calc(50% - ${modalHeight / 2}px - 60px)`;
-            
-            // Update navigation and close button positions
-            if (card.navContainer) {
-              card.navContainer.style.transition = 'all 0.4s ease';
-              card.navContainer.style.top = `calc(50% + ${modalHeight / 2}px + 30px)`;
-            }
-            closeBtn.style.transition = 'all 0.4s ease';
-            if (hasMultipleImages) {
-              closeBtn.style.top = `calc(50% + ${modalHeight / 2}px + 90px)`;
-            } else {
-              closeBtn.style.top = `calc(50% + ${modalHeight / 2}px + 90px)`;
-            }
-          }
-          
-          fullViewBtn.textContent = '⭕ Circle View';
-        } else {
-          // Circle view - restore to circular modal
-          card.style.transition = 'all 0.4s ease';
-          card.style.width = modalSize;
-          card.style.height = modalHeight;
-          card.style.borderRadius = '50%';
-          
-          mediaContainer.style.borderRadius = '50%';
-          if (vignette) vignette.style.borderRadius = '50%';
-          if (imgElement) {
-            imgElement.style.objectFit = 'cover';
-            imgElement.style.borderRadius = '50%';
-          }
-          
-          // Restore caption position
-          captionEl.style.transition = 'all 0.4s ease';
-          captionEl.style.top = `calc(50% - ${calculatedSize / 2}px - 60px)`;
-          
-          // Restore navigation and close button positions
-          if (card.navContainer) {
-            card.navContainer.style.transition = 'all 0.4s ease';
-            card.navContainer.style.top = `calc(50% + ${calculatedSize / 2}px + 30px)`;
-          }
-          closeBtn.style.transition = 'all 0.4s ease';
-          if (hasMultipleImages) {
-            closeBtn.style.top = `calc(50% + ${calculatedSize / 2}px + 90px)`;
-          } else {
-            closeBtn.style.top = `calc(50% + ${calculatedSize / 2}px + 90px)`;
-          }
-          
-          fullViewBtn.textContent = '🔍 Full View';
-        }
-      });
-    }
-    
-    // Navigation for multiple images - positioned outside above close button
-    if (hasMultipleImages && !isVideo) {
-      const folder = this.portfolioData.folder;
-      const cardKey = orb.cardKey;
-      const totalImages = orb.slideshowImages.length;
-      
-      const navContainer = document.createElement('div');
-      navContainer.style.cssText = `
-        position: fixed;
-        top: calc(50% + ${calculatedSize / 2}px + 30px);
-        left: 50%;
-        transform: translateX(-50%);
-        display: flex;
-        align-items: center;
-        gap: 1.5rem;
-        z-index: 1001;
-      `;
-      
-      const prevBtn = document.createElement('button');
-      prevBtn.textContent = '←';
-      prevBtn.style.cssText = `
-        width: 40px;
-        height: 40px;
-        background: rgba(255, 215, 0, 0.2);
-        border: 2px solid rgba(255, 215, 0, 0.5);
-        border-radius: 50%;
-        color: #FFD700;
-        cursor: pointer;
-        font-size: 1.2rem;
-        transition: all 0.3s ease;
-        box-shadow: 0 0 10px rgba(255, 215, 0, 0.3);
-      `;
-      
-      prevBtn.addEventListener('mouseenter', () => {
-        prevBtn.style.background = 'rgba(255, 215, 0, 0.4)';
-        prevBtn.style.boxShadow = '0 0 20px rgba(255, 215, 0, 0.6)';
-        prevBtn.style.transform = 'scale(1.1)';
-      });
-      
-      prevBtn.addEventListener('mouseleave', () => {
-        prevBtn.style.background = 'rgba(255, 215, 0, 0.2)';
-        prevBtn.style.boxShadow = '0 0 10px rgba(255, 215, 0, 0.3)';
-        prevBtn.style.transform = 'scale(1)';
-      });
-      
-      const counter = document.createElement('span');
-      counter.textContent = `1 / ${totalImages}`;
-      counter.style.cssText = `
-        color: #FFD700;
-        font-size: 1.1rem;
-        text-shadow: 0 0 10px rgba(255, 215, 0, 0.8);
-      `;
-      
-      const nextBtn = document.createElement('button');
-      nextBtn.textContent = '→';
-      nextBtn.style.cssText = prevBtn.style.cssText;
-      
-      nextBtn.addEventListener('mouseenter', () => {
-        nextBtn.style.background = 'rgba(255, 215, 0, 0.4)';
-        nextBtn.style.boxShadow = '0 0 20px rgba(255, 215, 0, 0.6)';
-        nextBtn.style.transform = 'scale(1.1)';
-      });
-      
-      nextBtn.addEventListener('mouseleave', () => {
-        nextBtn.style.background = 'rgba(255, 215, 0, 0.2)';
-        nextBtn.style.boxShadow = '0 0 10px rgba(255, 215, 0, 0.3)';
-        nextBtn.style.transform = 'scale(1)';
-      });
-      
-      const updateImage = () => {
-        const imageNumber = currentImageIndex + 1;
-        const newImagePath = `assets/portfolios/${folder}/${cardKey}/${imageNumber}.jpg`;
-        const imgElement = mediaContainer.querySelector('img');
-        
-        if (imgElement) {
-          imgElement.src = newImagePath;
-          counter.textContent = `${imageNumber} / ${totalImages}`;
-        }
-      };
-      
-      prevBtn.addEventListener('click', (e) => {
-        e.stopPropagation();
-        currentImageIndex = (currentImageIndex - 1 + totalImages) % totalImages;
-        updateImage();
-      });
-      
-      nextBtn.addEventListener('click', (e) => {
-        e.stopPropagation();
-        currentImageIndex = (currentImageIndex + 1) % totalImages;
-        updateImage();
-      });
-      
-      navContainer.appendChild(prevBtn);
-      navContainer.appendChild(counter);
-      navContainer.appendChild(nextBtn);
-      
-      // Add full view button to navigation container
-      if (fullViewBtn) {
-        navContainer.appendChild(fullViewBtn);
-      }
-      
-      this.container.appendChild(navContainer);
-      
-      // Store reference for cleanup
-      card.navContainer = navContainer;
-    } else if (fullViewBtn && !isVideo) {
-      // No multiple images, but still show full view button alone
-      const navContainer = document.createElement('div');
-      navContainer.style.cssText = `
-        position: fixed;
-        top: calc(50% + ${calculatedSize / 2}px + 30px);
-        left: 50%;
-        transform: translateX(-50%);
-        display: flex;
-        align-items: center;
-        gap: 1.5rem;
-        z-index: 1001;
-      `;
-      
-      navContainer.appendChild(fullViewBtn);
-      this.container.appendChild(navContainer);
-      card.navContainer = navContainer;
-    }
-    
-    // Close button - positioned outside below navigation
-    const closeBtn = document.createElement('button');
-    closeBtn.textContent = 'Close';
-    closeBtn.style.cssText = `
-      position: fixed;
-      top: calc(50% + ${calculatedSize / 2}px + 90px);
-      left: 50%;
-      transform: translateX(-50%);
-      padding: 0.75rem 2rem;
-      background: rgba(255, 215, 0, 0.3);
-      border: 2px solid rgba(255, 215, 0, 0.6);
-      border-radius: 25px;
-      color: #FFD700;
-      font-size: 1.1rem;
-      font-weight: bold;
-      cursor: pointer;
-      z-index: 1001;
-      opacity: 0;
-      transition: all 0.3s ease 0.15s;
-      box-shadow: 0 0 15px rgba(255, 215, 0, 0.4);
-    `;
-    
-    // Fade in close button
-    setTimeout(() => {
-      closeBtn.style.opacity = '1';
-    }, 10);
-    
-    closeBtn.addEventListener('mouseenter', () => {
-      closeBtn.style.background = 'rgba(255, 215, 0, 0.5)';
-      closeBtn.style.boxShadow = '0 0 25px rgba(255, 215, 0, 0.7)';
-      closeBtn.style.transform = 'translateX(-50%) scale(1.05)';
-    });
-    
-    closeBtn.addEventListener('mouseleave', () => {
-      closeBtn.style.background = 'rgba(255, 215, 0, 0.3)';
-      closeBtn.style.boxShadow = '0 0 15px rgba(255, 215, 0, 0.4)';
-      closeBtn.style.transform = 'translateX(-50%) scale(1)';
-    });
-    
-    closeBtn.addEventListener('click', () => {
-      const video = card.querySelector('video');
-      if (video) {
-        video.pause();
-        video.src = ''; // Clear video source
-        video.load(); // Reset video element
-      }
-      
-      // Animate out
-      card.style.opacity = '0';
-      card.style.transform = 'translate(-50%, -50%) scale(0.8)';
-      captionEl.style.opacity = '0';
-      closeBtn.style.opacity = '0';
-      backdrop.style.background = 'rgba(0, 0, 0, 0)';
-      backdrop.style.backdropFilter = 'blur(0px)';
-      backdrop.style.webkitBackdropFilter = 'blur(0px)';
-      if (card.navContainer) card.navContainer.style.opacity = '0';
-      
-      // Remove all modal elements after animation
-      setTimeout(() => {
-        // Clean up image element
-        const imgElement = card.querySelector('img');
-        if (imgElement) {
-          imgElement.src = ''; // Clear image source
-          imgElement.remove();
-        }
-        
-        // Clean up video element
-        if (video) {
-          video.remove();
-        }
-        
-        // Remove all elements
-        card.remove();
-        closeBtn.remove();
-        captionEl.remove();
-        backdrop.remove();
-        if (card.navContainer) card.navContainer.remove();
-        
-        // Resume Three.js animation
-        if (!this.animationFrameId) {
-          this.animate();
-        }
-      }, 300);
-    });
-    
-    this.container.appendChild(captionEl);
-    card.appendChild(closeBtn);
-    this.container.appendChild(card);
-    this.container.appendChild(closeBtn);
-    
-    // Add animation keyframes for pulsing glow effect
-    if (!document.querySelector('#modal-pulse-animation')) {
-      const style = document.createElement('style');
-      style.id = 'modal-pulse-animation';
-      style.textContent = `
-        @keyframes modalPulse {
-          0%, 100% {
-            box-shadow: 
-              0 0 30px rgba(247, 156, 0, 0.6),
-              0 0 60px rgba(247, 156, 0, 0.4),
-              0 0 90px rgba(247, 156, 0, 0.2),
-              inset 0 0 40px rgba(247, 156, 0, 0.1);
-          }
-          50% {
-            box-shadow: 
-              0 0 40px rgba(247, 156, 0, 0.8),
-              0 0 80px rgba(247, 156, 0, 0.5),
-              0 0 120px rgba(247, 156, 0, 0.3),
-              inset 0 0 50px rgba(247, 156, 0, 0.15);
-          }
-        }
-      `;
-      document.head.appendChild(style);
-    }
-  }
-  
-  /**
-   * Handle orb click
-   */
-  onOrbClick(event) {
-    if (!this.isActive) return;
-    
-    // Get mouse position
-    const rect = this.renderer.domElement.getBoundingClientRect();
-    const mouse = new THREE.Vector2(
-      ((event.clientX - rect.left) / rect.width) * 2 - 1,
-      -((event.clientY - rect.top) / rect.height) * 2 + 1
-    );
-    
-    // Raycaster for click detection
-    const raycaster = new THREE.Raycaster();
-    raycaster.setFromCamera(mouse, this.camera);
-    
-    // Check intersections with orbs
-    const orbMeshes = this.orbs.map(orb => orb.mesh);
-    const intersects = raycaster.intersectObjects(orbMeshes);
-    
-    if (intersects.length > 0) {
-      const clickedMesh = intersects[0].object;
-      const clickedOrb = this.orbs.find(orb => orb.mesh === clickedMesh);
 
-      if (clickedOrb) {
-        // Trigger click animation, delay content until after it plays
-        if (Object.keys(this.clickPose).length > 0) {
-          this.clickAnimLerp = 1;
-          setTimeout(() => { this.clickAnimLerp = 0; }, 600);
-          setTimeout(() => { this.showMediaModal(clickedOrb); }, 350);
-        } else {
-          this.clickAnimTarget = 1;
-          setTimeout(() => { this.clickAnimTarget = 0; }, 200);
-          this.showMediaModal(clickedOrb);
-        }
+      syncChrome();
+      this.prefetchMemoryNeighbours(items, current);
+    };
+
+    const goTo = (index) => {
+      if (!total) return;
+      const next = Math.max(0, Math.min(total - 1, index));
+      if (next === current) return;
+      current = next;
+      mount();
+    };
+
+    const close = () => {
+      if (this._mediaModal !== overlay) return;
+      this._mediaModal = null;
+      this._mediaClose = null;
+      generation += 1;
+
+      const playing = stage.querySelector('video');
+      if (playing) {
+        playing.pause();
+        playing.removeAttribute('src');
+        playing.load();
       }
-    }
-  }
-  
-  /**
-   * Show media modal with full image/video
-   */
-  showMediaModal(orb) {
-    console.log('=== showMediaModal called ===');
-    console.log('Orb data:', orb);
-    
-    // Get orb color for modal styling
-    const orbColorData = orb.colorData || { hex: 0xF79C00, rgb: [247, 156, 0] }; // Default to amber
-    const colorRgb = `${orbColorData.rgb[0]}, ${orbColorData.rgb[1]}, ${orbColorData.rgb[2]}`;
-    const colorHex = `#${orbColorData.hex.toString(16).padStart(6, '0')}`;
-    
-    // Create modal overlay
-    const modal = document.createElement('div');
-    modal.style.cssText = `
-      position: fixed;
-      top: 0;
-      left: 0;
-      width: 100%;
-      height: 100%;
-      background: rgba(0, 0, 0, 0.95);
-      z-index: 10000;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      backdrop-filter: blur(10px);
-    `;
-    
-    // Create content container with FIXED dimensions
-    const content = document.createElement('div');
-    content.style.cssText = `
-      position: relative;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      gap: 20px;
-      width: 90vw;
-      max-width: 1200px;
-    `;
-    
-    // Create a FIXED-SIZE image container to prevent resizing
-    const imageContainer = document.createElement('div');
-    imageContainer.style.cssText = `
-      width: 85vw;
-      height: 75vh;
-      max-width: 1100px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      background: rgba(0, 0, 0, 0.5);
-      border-radius: 60px;
-      box-shadow: 0 0 50px rgba(${colorRgb}, 0.5);
-      overflow: hidden;
-    `;
-    
-    // Create media element (video or image)
-    let mediaElement;
-    const folder = this.portfolioData?.folder;
-    const videoPath = folder ? `assets/portfolios/${folder}/${orb.cardKey}/1.mp4` : null;
-    const imagePath = folder ? `assets/portfolios/${folder}/${orb.cardKey}/1.jpg` : null;
-    
-    // Try video first, then fallback to image
-    // Only try video if the orb actually has a working video element that loaded successfully
-    const tryVideo = videoPath && orb.videoElement && orb.videoElement.readyState >= 2;
-    
-    if (tryVideo) {
-      // Show video
-      mediaElement = document.createElement('video');
-      mediaElement.src = videoPath;
-      mediaElement.controls = true;
-      mediaElement.autoplay = true;
-      mediaElement.loop = true;
-      mediaElement.muted = false; // Enable sound in modal
-      mediaElement.style.cssText = `
-        max-width: 85vw;
-        max-height: 75vh;
-        width: auto;
-        height: auto;
-        object-fit: contain;
-        border-radius: 10px;
-        box-shadow: 0 0 50px rgba(${colorRgb}, 0.5);
-        background: rgba(0, 0, 0, 0.5);
-      `;
-      
-      // Fallback to image if video fails to load
-      mediaElement.addEventListener('error', () => {
-        console.log('Video failed to load, trying image:', videoPath);
-        if (imagePath) {
-          const img = document.createElement('img');
-          img.src = imagePath;
-          img.style.cssText = mediaElement.style.cssText;
-          img.onerror = () => {
-            // Show error message
-            img.alt = 'Empty Memory';
-            img.style.display = 'none';
-            const errorMsg = document.createElement('div');
-            errorMsg.textContent = 'Empty Memory';
-            errorMsg.style.cssText = `
-              color: rgba(255, 255, 255, 0.5);
-              font-size: 1.5rem;
-              padding: 40px;
-            `;
-            mediaElement.parentNode.replaceChild(errorMsg, mediaElement);
-          };
-          mediaElement.parentNode.replaceChild(img, mediaElement);
-        }
-      });
-    } else if (imagePath || (orb.slideshowImages && orb.slideshowImages.length > 0)) {
-      // Show image - ALWAYS load from file path, not from orb's processed images
-      const img = document.createElement('img');
-      
-      // Load the first image directly from file path (1.jpg)
-      if (orb.slideshowImages && orb.slideshowImages.length > 0) {
-        // Load from file path, not from orb.slideshowImages[0].src
-        img.src = `assets/portfolios/${folder}/${orb.cardKey}/1.jpg`;
-      } else if (imagePath) {
-        // Load from path
-        img.src = imagePath;
+
+      window.removeEventListener('keydown', onKeyDown, true);
+      window.removeEventListener('resize', onResize);
+      overlay.classList.remove('is-open');
+
+      const remove = () => overlay.remove();
+      window.setTimeout(remove, 240);
+
+      if (this._mediaReturn && this._mediaReturn.focus) {
+        this._mediaReturn.focus({ preventScroll: true });
       }
-      
-      // Image fits within the fixed container
-      img.style.cssText = `
-        max-width: 100%;
-        max-height: 100%;
-        width: auto;
-        height: auto;
-        object-fit: contain;
-        object-position: center;
-        border-radius: 60px;
-      `;
-      
-      // Show error if image fails
-      img.onerror = () => {
-        console.log('Image failed to load:', imagePath);
-        img.alt = 'Empty Memory';
-        img.style.display = 'none';
-        const errorMsg = document.createElement('div');
-        errorMsg.textContent = 'Empty Memory';
-        errorMsg.style.cssText = `
-          color: rgba(255, 255, 255, 0.5);
-          font-size: 1.5rem;
-          padding: 40px;
-        `;
-        imageContainer.appendChild(errorMsg);
-      };
-      
-      imageContainer.appendChild(img);
-      mediaElement = imageContainer;
-      // Store reference to img for updates
-      mediaElement.imgElement = img;
-    } else {
-      // No media available
-      mediaElement = document.createElement('div');
-      mediaElement.textContent = 'Empty Memory';
-      mediaElement.style.cssText = `
-        color: rgba(255, 255, 255, 0.5);
-        font-size: 1.5rem;
-        padding: 40px;
-      `;
-    }
-    
-    // Create caption
-    const caption = document.createElement('div');
-    caption.textContent = orb.caption;
-    caption.style.cssText = `
-      color: white;
-      font-size: 1.5rem;
-      font-weight: bold;
-      text-align: center;
-      text-shadow: 0 0 10px rgba(${colorRgb}, 0.8);
-    `;
-    
-    // Create close button
-    const closeBtn = document.createElement('button');
-    closeBtn.textContent = '✕';
-    closeBtn.style.cssText = `
-      position: absolute;
-      top: -60px;
-      right: 0;
-      background: rgba(255, 255, 255, 0.2);
-      border: 2px solid rgba(${colorRgb}, 0.5);
-      color: white;
-      font-size: 2rem;
-      width: 50px;
-      height: 50px;
-      border-radius: 50%;
-      cursor: pointer;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      transition: all 0.3s ease;
-    `;
-    
-    closeBtn.addEventListener('mouseenter', () => {
-      closeBtn.style.background = `rgba(${colorRgb}, 0.3)`;
-      closeBtn.style.transform = 'scale(1.1)';
-    });
-    
-    closeBtn.addEventListener('mouseleave', () => {
-      closeBtn.style.background = 'rgba(255, 255, 255, 0.2)';
-      closeBtn.style.transform = 'scale(1)';
-    });
-    
-    closeBtn.addEventListener('click', () => {
-      // Stop video if playing
-      if (mediaElement.tagName === 'VIDEO') {
-        mediaElement.pause();
-      }
-      document.body.removeChild(modal);
-      // Resume animation loop
-      this.isActive = true;
-      this.animate();
-    });
-    
-    // Navigation for multiple images
-    let currentImageIndex = 0;
-    const totalImages = orb.slideshowImages ? orb.slideshowImages.length : 0;
-    const hasMultipleImages = totalImages > 1;
-    
-    console.log('Navigation check:', {
-      totalImages: totalImages,
-      hasMultipleImages: hasMultipleImages,
-      orbHasSlideshowImages: !!orb.slideshowImages,
-      slideshowImagesLength: orb.slideshowImages?.length
-    });
-    
-    // Create navigation container
-    let navigationDiv = null;
-    if (hasMultipleImages) {
-      console.log('Creating navigation for', totalImages, 'images');
-      navigationDiv = document.createElement('div');
-      navigationDiv.style.cssText = `
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        gap: 2rem;
-        margin-top: 1.5rem;
-      `;
-      
-      // Previous button
-      const prevButton = document.createElement('button');
-      prevButton.textContent = '← Previous';
-      prevButton.style.cssText = `
-        padding: 0.75rem 1.5rem;
-        background: rgba(${colorRgb}, 0.2);
-        border: 2px solid rgba(${colorRgb}, 0.5);
-        border-radius: 10px;
-        color: ${colorHex};
-        font-size: 1rem;
-        font-weight: bold;
-        cursor: pointer;
-        transition: all 0.3s ease;
-        text-shadow: 0 0 10px rgba(${colorRgb}, 0.8);
-      `;
-      
-      // Counter
-      const counterSpan = document.createElement('span');
-      counterSpan.textContent = `1 / ${totalImages}`;
-      counterSpan.style.cssText = `
-        color: ${colorHex};
-        font-size: 1.2rem;
-        font-weight: bold;
-        text-shadow: 0 0 10px rgba(${colorRgb}, 0.8);
-        min-width: 100px;
-        text-align: center;
-      `;
-      
-      // Next button
-      const nextButton = document.createElement('button');
-      nextButton.textContent = 'Next →';
-      nextButton.style.cssText = prevButton.style.cssText;
-      
-      // Update image function
-      const updateDisplayedImage = () => {
-        const imageNumber = currentImageIndex + 1;
-        const newImagePath = `assets/portfolios/${folder}/${orb.cardKey}/${imageNumber}.jpg`;
-        
-        // Find the img element inside mediaElement (which is the imageContainer)
-        const imgElement = mediaElement.querySelector('img');
-        if (imgElement) {
-          imgElement.src = newImagePath;
-          counterSpan.textContent = `${imageNumber} / ${totalImages}`;
-        } else {
-          console.error('Could not find img element in mediaElement');
-        }
-      };
-      
-      // Button click handlers
-      prevButton.addEventListener('click', (e) => {
-        e.stopPropagation();
-        currentImageIndex = (currentImageIndex - 1 + totalImages) % totalImages;
-        updateDisplayedImage();
-      });
-      
-      nextButton.addEventListener('click', (e) => {
-        e.stopPropagation();
-        currentImageIndex = (currentImageIndex + 1) % totalImages;
-        updateDisplayedImage();
-      });
-      
-      // Hover effects
-      [prevButton, nextButton].forEach(btn => {
-        btn.addEventListener('mouseenter', () => {
-          btn.style.background = `rgba(${colorRgb}, 0.4)`;
-          btn.style.transform = 'scale(1.05)';
-        });
-        btn.addEventListener('mouseleave', () => {
-          btn.style.background = `rgba(${colorRgb}, 0.2)`;
-          btn.style.transform = 'scale(1)';
-        });
-      });
-      
-      navigationDiv.appendChild(prevButton);
-      navigationDiv.appendChild(counterSpan);
-      navigationDiv.appendChild(nextButton);
-      
-      console.log('Navigation div created and populated:', navigationDiv);
-      console.log('Navigation div has children:', navigationDiv.children.length);
-    }
-    
-    // Close on background click
-    modal.addEventListener('click', (e) => {
-      if (e.target === modal) {
-        // Stop video if playing
-        if (mediaElement.tagName === 'VIDEO') {
-          mediaElement.pause();
-        }
-        document.body.removeChild(modal);
-        // Resume animation loop
-        this.isActive = true;
-        this.animate();
-      }
-    });
-    
-    // Close on Escape key
-    const escapeHandler = (e) => {
-      if (e.key === 'Escape') {
-        // Stop video if playing
-        if (mediaElement.tagName === 'VIDEO') {
-          mediaElement.pause();
-        }
-        document.body.removeChild(modal);
-        document.removeEventListener('keydown', escapeHandler);
-        // Resume animation loop
+      this._mediaReturn = null;
+
+      if (this._mediaLoopWasActive) {
+        this._mediaLoopWasActive = false;
         this.isActive = true;
         this.animate();
       }
     };
-    document.addEventListener('keydown', escapeHandler);
-    
-    // Assemble modal
-    content.appendChild(closeBtn);
-    content.appendChild(caption);
-    content.appendChild(mediaElement);
-    
-    console.log('navigationDiv before append:', navigationDiv);
-    console.log('Will append navigation?', !!navigationDiv);
-    
-    if (navigationDiv) {
-      console.log('Appending navigation to content');
-      content.appendChild(navigationDiv);
-    } else {
-      console.log('No navigation to append');
-    }
-    
-    modal.appendChild(content);
-    document.body.appendChild(modal);
-    
-    // Pause animation loop while modal is open for better performance
+
+    const onResize = () => {
+      if (isFull) applyFrame();
+    };
+
+    const onKeyDown = (event) => {
+      if (event.key === 'Escape') {
+        // Capture phase: keep Escape from also leaving the hall behind us.
+        event.preventDefault();
+        event.stopPropagation();
+        close();
+        return;
+      }
+      if (total > 1 && (event.key === 'ArrowRight' || event.key === 'ArrowLeft')) {
+        event.preventDefault();
+        event.stopPropagation();
+        goTo(current + (event.key === 'ArrowRight' ? 1 : -1));
+        return;
+      }
+      if (event.key === 'Tab') {
+        const stops = Array.from(overlay.querySelectorAll(
+          'button:not(:disabled), a[href], video[controls]'
+        ));
+        if (!stops.length) return;
+        const first = stops[0];
+        const last = stops[stops.length - 1];
+        const active = document.activeElement;
+        if (event.shiftKey && (active === first || !overlay.contains(active))) {
+          event.preventDefault();
+          last.focus();
+        } else if (!event.shiftKey && active === last) {
+          event.preventDefault();
+          first.focus();
+        }
+      }
+    };
+
+    overlay.addEventListener('click', (event) => {
+      if (event.target === overlay) {
+        close();
+        return;
+      }
+      if (event.target.closest('[data-media-close]')) {
+        close();
+        return;
+      }
+      if (event.target.closest('[data-media-full]')) {
+        toggleFullFrame();
+        return;
+      }
+      const step = event.target.closest('[data-media-step]');
+      if (step) {
+        goTo(current + Number(step.getAttribute('data-media-step')));
+        return;
+      }
+      const dot = event.target.closest('[data-media-dot]');
+      if (dot) {
+        goTo(Number(dot.getAttribute('data-media-dot')));
+        return;
+      }
+      // Tapping the memory itself opens the whole frame, like the orb's crown.
+      const onMedia = event.target.tagName === 'IMG' ||
+        event.target.classList.contains('dv-orb__media');
+      if (onMedia && !isVideo && Date.now() - swipedAt > 320) {
+        toggleFullFrame();
+      }
+    });
+
+    stage.addEventListener('pointerdown', (event) => {
+      swipeStart = { x: event.clientX, y: event.clientY };
+    });
+
+    stage.addEventListener('pointerup', (event) => {
+      if (!swipeStart) return;
+      const dx = event.clientX - swipeStart.x;
+      const dy = event.clientY - swipeStart.y;
+      swipeStart = null;
+      if (Math.abs(dx) > 60 && Math.abs(dy) < 50) {
+        swipedAt = Date.now();
+        goTo(current + (dx < 0 ? 1 : -1));
+      }
+    });
+
+    stage.addEventListener('pointercancel', () => { swipeStart = null; });
+
+    // Pause the hall while the memory is open, and let go of the mouse so the
+    // orb can actually be clicked.
+    this._mediaLoopWasActive = this.isActive;
     this.isActive = false;
+    if (document.pointerLockElement) document.exitPointerLock();
+
+    this._mediaReturn = document.activeElement;
+    this._mediaModal = overlay;
+    this._mediaClose = close;
+    window.addEventListener('keydown', onKeyDown, true);
+    window.addEventListener('resize', onResize);
+
+    document.body.appendChild(overlay);
+    window.requestAnimationFrame(() => overlay.classList.add('is-open'));
+    overlay.focus({ preventScroll: true });
+
+    if (total) {
+      mount();
+    } else {
+      frame.dataset.state = 'empty';
+      stage.innerHTML = errorCard('No media yet', 'This orb has no photos or clips attached.', null);
+      syncChrome();
+    }
   }
 
+  /**
+   * Every file behind an orb, in manifest order, with previews where they exist.
+   */
+  orbMediaItems(orb) {
+    const folder = this.portfolioData?.folder || null;
+    const manifest = folder && window.portfolioMedia ? window.portfolioMedia[folder] : null;
+    const listing = manifest ? manifest[orb.cardKey] : null;
+
+    const isVideoFile = (name) => /\.(mp4|webm|mov|m4v)$/i.test(name);
+    const isImageFile = (name) => /\.(jpe?g|png|webp|gif|avif)$/i.test(name);
+
+    let items = [];
+
+    if (folder && listing && listing.length) {
+      items = listing.map((file) => ({
+        file,
+        src: 'assets/portfolios/' + folder + '/' + orb.cardKey + '/' + file,
+        thumb: isImageFile(file)
+          ? 'assets/thumbs/' + folder + '/' + orb.cardKey + '/' + file
+          : null,
+        isVideo: isVideoFile(file)
+      }));
+    } else if (orb.videoElement && orb.videoElement.src) {
+      // Folders built before the manifest existed still open from what the orb
+      // already loaded, instead of probing guessed file names.
+      items.push({ file: 'clip', src: orb.videoElement.src, thumb: null, isVideo: true });
+    }
+
+    if (!items.length && orb.slideshowImages && orb.slideshowImages.length) {
+      items = orb.slideshowImages.map((image) => ({
+        file: 'still',
+        src: image.src,
+        thumb: image.src,
+        isVideo: false
+      }));
+    }
+
+    return items;
+  }
+
+  /**
+   * The orb's own colour, lifted far enough to read on a dark room.
+   */
+  mediaAccent(orb) {
+    const rgb = orb && orb.colorData && orb.colorData.rgb;
+    if (!rgb) return '240, 166, 60';
+    const lift = (channel) => Math.round(channel + (255 - channel) * 0.42);
+    return lift(rgb[0]) + ', ' + lift(rgb[1]) + ', ' + lift(rgb[2]);
+  }
+
+  /**
+   * Warm the files either side of the one on screen.
+   */
+  prefetchMemoryNeighbours(items, index) {
+    [-1, 1].forEach((delta) => {
+      const item = items[index + delta];
+      if (!item || item.isVideo) return;
+      const img = new Image();
+      img.src = item.src;
+    });
+  }
+
+  /**
+   * Styles for the orb viewer, injected once.
+   */
+  injectMediaStyles() {
+    if (document.getElementById('dv-orb-styles')) return;
+
+    const style = document.createElement('style');
+    style.id = 'dv-orb-styles';
+    style.textContent = `
+      /* The room dims to the orb's own light. */
+      .dv-orb {
+        position: fixed;
+        inset: 0;
+        z-index: 10000;
+        display: grid;
+        place-items: center;
+        padding: clamp(14px, 3vh, 28px);
+        background:
+          radial-gradient(
+            72% 60% at 50% 42%,
+            rgba(var(--dv-accent-rgb), 0.14) 0%,
+            rgba(4, 6, 11, 0) 62%
+          ),
+          radial-gradient(
+            125% 105% at 50% 50%,
+            rgba(3, 5, 9, 0.6) 40%,
+            rgba(2, 3, 5, 0.92) 100%
+          );
+        /* The hall stays a room: dimmed and out of focus behind the orb. */
+        backdrop-filter: blur(12px) saturate(125%);
+        -webkit-backdrop-filter: blur(12px) saturate(125%);
+        color: #f4f5f9;
+        opacity: 0;
+        transition: opacity 220ms ease;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .dv-orb:focus { outline: none; }
+      .dv-orb.is-open { opacity: 1; }
+
+      .dv-orb__stage {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: clamp(10px, 1.6vh, 16px);
+        max-height: 100%;
+      }
+
+      .dv-orb__heading { text-align: center; }
+
+      .dv-orb__eyebrow {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        margin: 0;
+        font-size: 10px;
+        letter-spacing: 0.18em;
+        text-transform: uppercase;
+        color: rgba(var(--dv-accent-rgb), 0.9);
+      }
+
+      .dv-orb__spark {
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: rgb(var(--dv-accent-raw));
+      }
+
+      .dv-orb__title {
+        margin: 6px 0 0;
+        font-size: clamp(19px, 1.6vw + 12px, 26px);
+        font-weight: 650;
+        letter-spacing: -0.02em;
+        line-height: 1.1;
+        color: var(--dv-accent);
+      }
+
+      .dv-orb__meta {
+        margin: 6px 0 0;
+        font-size: 10px;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+        color: #8d97a9;
+      }
+
+      /* The orb itself. */
+      .dv-orb__frame {
+        position: relative;
+        width: min(70vh, 84vw, 520px);
+        aspect-ratio: 1;
+        border-radius: 50%;
+        overflow: hidden;
+        isolation: isolate;
+        background: #05070c;
+        box-shadow:
+          0 0 0 3px rgb(var(--dv-accent-raw)),
+          0 0 22px -2px rgba(var(--dv-accent-raw), 0.9),
+          0 0 70px -4px rgba(var(--dv-accent-raw), 0.55),
+          0 0 150px -20px rgba(var(--dv-accent-raw), 0.45),
+          0 34px 80px -30px rgba(0, 0, 0, 0.95);
+        transition:
+          width 460ms cubic-bezier(0.4, 0, 0.2, 1),
+          height 460ms cubic-bezier(0.4, 0, 0.2, 1),
+          border-radius 420ms cubic-bezier(0.4, 0, 0.2, 1);
+      }
+
+      /* Clips keep their controls readable, so they keep corners. */
+      .dv-orb__frame.is-video { border-radius: 28px; }
+      .dv-orb__frame.is-full { border-radius: 18px; }
+
+      .dv-orb__media { position: absolute; inset: 0; }
+
+      .dv-orb__media img,
+      .dv-orb__media video {
+        display: block;
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+        object-position: center;
+        opacity: 0;
+        transition: opacity 260ms ease;
+      }
+
+      .dv-orb__frame[data-state='ready'] .dv-orb__media img,
+      .dv-orb__frame[data-state='ready'] .dv-orb__media video { opacity: 1; }
+
+      /* The grown frame is sized to the file's own aspect, so cover already
+         shows the whole memory there - no flash as the crop releases. */
+
+      /* The memory dissolves into the orb's colour at the rim. */
+      .dv-orb__vignette {
+        position: absolute;
+        inset: 0;
+        pointer-events: none;
+        background: radial-gradient(
+          circle at 50% 50%,
+          rgba(var(--dv-accent-raw), 0) 0%,
+          rgba(var(--dv-accent-raw), 0) 48%,
+          rgba(var(--dv-accent-raw), 0.18) 64%,
+          rgba(var(--dv-accent-raw), 0.42) 76%,
+          rgba(var(--dv-accent-raw), 0.72) 88%,
+          rgba(var(--dv-accent-raw), 1) 99%
+        );
+        transition: opacity 300ms ease;
+      }
+
+      .dv-orb__frame.is-full .dv-orb__vignette { opacity: 0.4; }
+
+      /* A clip fills a rectangle, so its falloff is an ellipse and far gentler:
+         the footage has to stay readable. */
+      .dv-orb__frame.is-video .dv-orb__vignette {
+        background: radial-gradient(
+          ellipse 64% 58% at 50% 50%,
+          rgba(var(--dv-accent-raw), 0) 46%,
+          rgba(var(--dv-accent-raw), 0.09) 74%,
+          rgba(var(--dv-accent-raw), 0.3) 100%
+        );
+      }
+
+      /* Glass highlight, same as the orbs hanging in the hall. */
+      .dv-orb__glass {
+        position: absolute;
+        inset: 0;
+        pointer-events: none;
+        background:
+          radial-gradient(56% 44% at 32% 16%, rgba(255, 255, 255, 0.15), transparent 64%),
+          radial-gradient(38% 28% at 76% 86%, rgba(255, 255, 255, 0.05), transparent 70%);
+        mix-blend-mode: screen;
+        opacity: 0.5;
+      }
+
+      .dv-orb__frame[data-state='loading']::after {
+        content: '';
+        position: absolute;
+        inset: 0;
+        border-radius: inherit;
+        background: linear-gradient(
+            100deg,
+            transparent 22%,
+            rgba(255, 255, 255, 0.08) 46%,
+            transparent 72%
+          ) 0 0 / 220% 100%;
+        animation: dv-orb-shimmer 1.3s linear infinite, dv-orb-fade 200ms ease 140ms both;
+        pointer-events: none;
+      }
+
+      @keyframes dv-orb-shimmer {
+        from { background-position: 120% 0; }
+        to { background-position: -120% 0; }
+      }
+
+      @keyframes dv-orb-fade {
+        from { opacity: 0; }
+        to { opacity: 1; }
+      }
+
+      .dv-orb__notice {
+        display: grid;
+        place-content: center;
+        gap: 6px;
+        height: 100%;
+        padding: 30px;
+        text-align: center;
+      }
+
+      .dv-orb__notice-title { margin: 0; font-size: 15px; font-weight: 600; }
+
+      .dv-orb__notice-body {
+        margin: 0 0 12px;
+        font-size: 12px;
+        line-height: 1.55;
+        color: #9aa4b8;
+      }
+
+      .dv-orb__link {
+        display: inline-flex;
+        align-items: center;
+        justify-self: center;
+        height: 34px;
+        padding: 0 14px;
+        border: 1px solid rgba(255, 255, 255, 0.16);
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.06);
+        color: inherit;
+        font-size: 12px;
+        text-decoration: none;
+      }
+
+      .dv-orb__link:hover { background: rgba(255, 255, 255, 0.12); }
+
+      .dv-orb__foot {
+        display: grid;
+        justify-items: center;
+        gap: 10px;
+      }
+
+      .dv-orb__dots { display: flex; gap: 2px; }
+
+      /* The dot stays small; the button around it is thumb-sized. */
+      .dv-orb__dot {
+        display: grid;
+        place-items: center;
+        width: 30px;
+        height: 30px;
+        padding: 0;
+        border: 0;
+        border-radius: 50%;
+        background: none;
+        cursor: pointer;
+        -webkit-tap-highlight-color: transparent;
+      }
+
+      .dv-orb__dot::before {
+        content: '';
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: rgba(255, 255, 255, 0.26);
+        transition: transform 180ms cubic-bezier(0.16, 1, 0.3, 1), background 180ms ease;
+      }
+
+      .dv-orb__dot:hover::before { background: rgba(255, 255, 255, 0.5); }
+
+      .dv-orb__dot.is-active::before {
+        background: rgb(var(--dv-accent-raw));
+        transform: scale(1.45);
+      }
+
+      .dv-orb__actions { display: flex; gap: 8px; }
+
+      .dv-orb__action {
+        height: 34px;
+        padding: 0 15px;
+        border: 1px solid rgba(255, 255, 255, 0.14);
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.05);
+        color: #e6eaf2;
+        font-size: 12px;
+        letter-spacing: 0.01em;
+        cursor: pointer;
+        transition: background 160ms ease, border-color 160ms ease, transform 120ms ease;
+      }
+
+      .dv-orb__action:hover:not(:disabled) {
+        background: rgba(255, 255, 255, 0.1);
+        border-color: rgba(255, 255, 255, 0.24);
+      }
+
+      .dv-orb__action:active:not(:disabled) { transform: translateY(1px); }
+      .dv-orb__action:disabled { opacity: 0.35; cursor: not-allowed; }
+
+      /* Side arrows live in the gutters of the room. */
+      .dv-orb__step {
+        position: absolute;
+        top: 50%;
+        z-index: 3;
+        width: 46px;
+        height: 46px;
+        display: grid;
+        place-items: center;
+        padding: 0;
+        border: 1px solid rgba(255, 255, 255, 0.14);
+        border-radius: 999px;
+        background: rgba(9, 12, 20, 0.55);
+        backdrop-filter: blur(10px);
+        -webkit-backdrop-filter: blur(10px);
+        color: inherit;
+        cursor: pointer;
+        transform: translateY(-50%);
+        transition: background 160ms ease, border-color 160ms ease, transform 120ms ease;
+      }
+
+      .dv-orb__step--prev { left: clamp(10px, 2vw, 26px); }
+      .dv-orb__step--next { right: clamp(10px, 2vw, 26px); }
+
+      .dv-orb__step:hover:not(:disabled) {
+        background: rgba(30, 36, 52, 0.8);
+        border-color: rgba(255, 255, 255, 0.26);
+      }
+
+      .dv-orb__step:active:not(:disabled) { transform: translateY(-50%) scale(0.96); }
+      .dv-orb__step:disabled { opacity: 0.25; cursor: not-allowed; }
+
+      .dv-orb__step svg {
+        width: 16px;
+        height: 16px;
+        stroke: currentColor;
+        stroke-width: 1.8;
+        fill: none;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+      }
+
+      /* Opening the orb: the circle arrives a touch small, then settles. */
+      @keyframes dv-orb-in {
+        from { opacity: 0; transform: scale(0.86); }
+        to { opacity: 1; transform: none; }
+      }
+
+      @keyframes dv-orb-rise {
+        from { opacity: 0; transform: translateY(6px); }
+        to { opacity: 1; transform: none; }
+      }
+
+      .dv-orb.is-open .dv-orb__frame {
+        animation: dv-orb-in 500ms cubic-bezier(0.16, 1, 0.3, 1) both;
+      }
+
+      .dv-orb.is-open .dv-orb__heading {
+        animation: dv-orb-rise 420ms cubic-bezier(0.16, 1, 0.3, 1) both;
+      }
+
+      .dv-orb.is-open .dv-orb__foot {
+        animation: dv-orb-rise 420ms 90ms cubic-bezier(0.16, 1, 0.3, 1) both;
+      }
+
+      @media (max-width: 620px) {
+        .dv-orb__frame { width: min(58vh, 84vw, 520px); }
+        /* The circle owns the width here; the dots do the stepping. */
+        .dv-orb__step { display: none; }
+        .dv-orb__title { font-size: 20px; }
+      }
+
+      /* Touch: swipe and the dots do the moving, at a 44px thumb target. */
+      @media (pointer: coarse) {
+        .dv-orb__step { display: none; }
+        .dv-orb__dot { width: 44px; height: 44px; }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .dv-orb,
+        .dv-orb__frame,
+        .dv-orb__media img,
+        .dv-orb__media video,
+        .dv-orb__dot,
+        .dv-orb__action {
+          transition-duration: 1ms;
+        }
+        .dv-orb.is-open .dv-orb__frame,
+        .dv-orb.is-open .dv-orb__heading,
+        .dv-orb.is-open .dv-orb__foot {
+          animation: none;
+        }
+      }
+    `;
+
+    document.head.appendChild(style);
+  }
   createPOVHand() {
     this.handScene = new THREE.Scene();
     this.handCamera = new THREE.PerspectiveCamera(45, this.container.clientWidth / this.container.clientHeight, 0.1, 100);
@@ -4584,13 +4336,16 @@ export class DetailView {
    * Handle mouse move
    */
   onMouseMove(event) {
-    if (!this.isMouseDown) return;
+    // Pointer lock: looking follows mouse movement without holding a button.
+    const locked = document.pointerLockElement != null;
+
+    if (!locked && !this.isMouseDown) return;
 
     // Don't allow mouse rotation if camera movement is disabled
     if (this.cameraMovementEnabled === false) return;
 
-    const deltaX = event.clientX - this.lastMouseX;
-    const deltaY = event.clientY - this.lastMouseY;
+    const deltaX = locked ? (event.movementX || 0) : event.clientX - this.lastMouseX;
+    const deltaY = locked ? (event.movementY || 0) : event.clientY - this.lastMouseY;
 
     this.cameraRotation.y -= deltaX * this.lookSpeed;
     this.cameraRotation.x -= deltaY * this.lookSpeed;
@@ -4598,8 +4353,10 @@ export class DetailView {
     // Clamp vertical rotation
     this.cameraRotation.x = Math.max(-Math.PI / 2, Math.min(Math.PI / 2, this.cameraRotation.x));
 
-    this.lastMouseX = event.clientX;
-    this.lastMouseY = event.clientY;
+    if (!locked) {
+      this.lastMouseX = event.clientX;
+      this.lastMouseY = event.clientY;
+    }
   }
 
   /**
@@ -4775,6 +4532,10 @@ export class DetailView {
    * Hide the detail view
    */
   hide() {
+    // Leaving the hall takes any open memory with it.
+    if (this._mediaClose) this._mediaClose();
+    this.isActive = false;
+
     // Remove any existing welcome screen
     const existingWelcome = document.getElementById('floating-welcome');
     if (existingWelcome) {
@@ -4841,6 +4602,7 @@ export class DetailView {
     if (!this.isActive) return;
 
     this.animationFrameId = requestAnimationFrame(this.animate);
+    if (this.adaptive) this.adaptive.sample();
     
     const deltaTime = 0.016; // ~60fps
     this.time += deltaTime;
@@ -4884,6 +4646,12 @@ export class DetailView {
       const distance = this.camera.position.distanceTo(orb.mesh.position);
       const videoPlayDistance = 50; // Play video only within 30 units
       
+      // Load the video file only when it first comes close enough to matter.
+      if (orb.startVideo && !orb.videoStarted && distance <= videoPlayDistance) {
+        orb.videoStarted = true;
+        orb.startVideo();
+      }
+
       // Control video playback based on distance
       if (orb.videoElement) {
         if (distance <= videoPlayDistance && isVisible) {
@@ -4987,31 +4755,34 @@ export class DetailView {
       
       // Animate platform particles (only every 2 frames - imperceptible difference)
       if (isVisible && frameCount % 2 === 0 && orb.platform && orb.platform.userData.particles) {
-        orb.platform.userData.particles.forEach(particle => {
+        const field = orb.platform.userData.particles;
+        const data = orb.platform.userData.particleData || [];
+
+        for (let i = 0; i < data.length; i++) {
+          const p = data[i];
+
           // Move particle upward
-          particle.position.y += particle.userData.velocity;
-          
+          p.y += p.velocity;
+
           // Expand outward as it rises (inverted cone shape)
-          const progress = particle.position.y / particle.userData.maxHeight;
-          const currentRadius = particle.userData.startRadius + progress * 2;
-          particle.position.x = Math.cos(particle.userData.angle) * currentRadius;
-          particle.position.z = Math.sin(particle.userData.angle) * currentRadius;
-          
+          const progress = p.y / p.maxHeight;
+          const currentRadius = p.startRadius + progress * 2;
+          field.setPosition(i, Math.cos(p.angle) * currentRadius, p.y, Math.sin(p.angle) * currentRadius);
+
           // Fade out as it rises
-          particle.material.opacity = 1 - progress;
-          
+          field.setAlpha(i, 1 - progress);
+
           // Reset when reaching max height
-          if (particle.position.y >= particle.userData.maxHeight) {
-            particle.position.y = 0;
-            const newAngle = Math.random() * Math.PI * 2;
-            const newRadius = Math.random() * 0.5;
-            particle.userData.angle = newAngle;
-            particle.userData.startRadius = newRadius;
-            particle.position.x = Math.cos(newAngle) * newRadius;
-            particle.position.z = Math.sin(newAngle) * newRadius;
-            particle.material.opacity = 1;
+          if (p.y >= p.maxHeight) {
+            p.y = 0;
+            p.angle = Math.random() * Math.PI * 2;
+            p.startRadius = Math.random() * 0.5;
+            field.setPosition(i, Math.cos(p.angle) * p.startRadius, 0, Math.sin(p.angle) * p.startRadius);
+            field.setAlpha(i, 1);
           }
-        });
+        }
+
+        field.commit(this.camera, this.renderer);
       }
     });
 
@@ -5237,13 +5008,16 @@ export class DetailView {
         }
         
         if (orb.platform) {
-          // Clean up platform particles
-          if (orb.platform.userData && orb.platform.userData.particles) {
-            orb.platform.userData.particles.forEach(particle => {
-              if (particle.geometry) particle.geometry.dispose();
-              if (particle.material) particle.material.dispose();
-            });
-            orb.platform.userData.particles = [];
+          // Clean up platform particles (one batched point cloud)
+          const field = orb.platform.userData && orb.platform.userData.particles;
+          if (field && field.mesh) {
+            orb.platform.remove(field.mesh);
+            field.dispose();
+            if (field.texture) field.texture.dispose();
+          }
+          if (orb.platform.userData) {
+            orb.platform.userData.particles = null;
+            orb.platform.userData.particleData = null;
           }
           
           orb.platform.traverse((child) => {

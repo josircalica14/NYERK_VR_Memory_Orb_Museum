@@ -6,6 +6,36 @@
 
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { ParticleField, attachAdaptiveResolution } from './PerfKit.js';
+
+// One shared soft dot for every point cloud that wants a round particle.
+// PointsMaterial draws an untextured point as a flat quad, which reads as a
+// hard-edged square on screen, so anything additive needs a radial map.
+let softDotCache = null;
+function softDotTexture() {
+  if (softDotCache) return softDotCache;
+
+  const size = 64;
+  const canvas = document.createElement('canvas');
+  canvas.width = size;
+  canvas.height = size;
+
+  const ctx = canvas.getContext('2d');
+  const gradient = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+  // Bright core, quick falloff: a soft dot carries less energy than the solid
+  // quad it replaces, so the centre stays at full alpha.
+  gradient.addColorStop(0, 'rgba(255, 255, 255, 1)');
+  gradient.addColorStop(0.3, 'rgba(255, 255, 255, 0.92)');
+  gradient.addColorStop(0.62, 'rgba(255, 255, 255, 0.38)');
+  gradient.addColorStop(1, 'rgba(255, 255, 255, 0)');
+
+  ctx.fillStyle = gradient;
+  ctx.fillRect(0, 0, size, size);
+
+  softDotCache = new THREE.CanvasTexture(canvas);
+  softDotCache.colorSpace = THREE.SRGBColorSpace;
+  return softDotCache;
+}
 
 export default class MainMuseum {
   constructor(container, portfolioData) {
@@ -118,9 +148,11 @@ export default class MainMuseum {
       powerPreference: 'high-performance'
     });
     this.renderer.setSize(this.container.clientWidth, this.container.clientHeight);
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-    this.renderer.shadowMap.enabled = true;
-    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    // Full pixel ratio where the GPU keeps up; steps down only if frames drag.
+    this.adaptive = attachAdaptiveResolution(this.renderer);
+    // Nothing in the lobby casts a shadow (every light has castShadow = false),
+    // so enabling the shadow map only costs a depth pass and shader variants.
+    this.renderer.shadowMap.enabled = false;
     this.container.appendChild(this.renderer.domElement);
   }
   
@@ -1027,45 +1059,38 @@ export default class MainMuseum {
     const pathwayEndX = openingX + (orbX - openingX) * (boxEndLength / totalDistance);
     const pathwayEndZ = openingZ + (orbZ - openingZ) * (boxEndLength / totalDistance);
     
-    // Create left side 3D borders (from pathway end to opening)
-    for (let i = 0; i < bordersPerSide; i++) {
-      const t = i / (bordersPerSide - 1); // 0 to 1
-      
-      // Position along the pathway from pathway end to opening
-      const posX = pathwayEndX + (openingX - pathwayEndX) * t;
-      const posZ = pathwayEndZ + (openingZ - pathwayEndZ) * t;
-      
-      // Offset to left side
-      const leftX = posX + perpX * pathwayHalfWidth;
-      const leftZ = posZ + perpZ * pathwayHalfWidth;
-      
-      const border = new THREE.Mesh(borderGeometry, borderMaterial);
-      border.position.set(leftX, 0.25, leftZ);
-      border.rotation.y = boxRotationY;
-      border.castShadow = true;
-      this.scene.add(border);
-      this.edges.push(border);
+    // Both rows of border blocks in one instanced draw call. Same blocks, same
+    // material and transforms as before - just submitted once instead of 28 times
+    // per pathway, which is where the old version spent most of its draw budget.
+    const borderMesh = new THREE.InstancedMesh(borderGeometry, borderMaterial, bordersPerSide * 2);
+    borderMesh.castShadow = true;
+
+    const dummy = new THREE.Object3D();
+    let instanceIndex = 0;
+
+    // side = +1 is the left row, -1 the right row
+    for (let side = 1; side >= -1; side -= 2) {
+      for (let i = 0; i < bordersPerSide; i++) {
+        const t = i / (bordersPerSide - 1); // 0 to 1
+
+        // Position along the pathway from pathway end to opening
+        const posX = pathwayEndX + (openingX - pathwayEndX) * t;
+        const posZ = pathwayEndZ + (openingZ - pathwayEndZ) * t;
+
+        dummy.position.set(
+          posX + perpX * pathwayHalfWidth * side,
+          0.25,
+          posZ + perpZ * pathwayHalfWidth * side
+        );
+        dummy.rotation.set(0, boxRotationY, 0);
+        dummy.updateMatrix();
+        borderMesh.setMatrixAt(instanceIndex++, dummy.matrix);
+      }
     }
-    
-    // Create right side 3D borders (from pathway end to opening)
-    for (let i = 0; i < bordersPerSide; i++) {
-      const t = i / (bordersPerSide - 1); // 0 to 1
-      
-      // Position along the pathway from pathway end to opening
-      const posX = pathwayEndX + (openingX - pathwayEndX) * t;
-      const posZ = pathwayEndZ + (openingZ - pathwayEndZ) * t;
-      
-      // Offset to right side
-      const rightX = posX - perpX * pathwayHalfWidth;
-      const rightZ = posZ - perpZ * pathwayHalfWidth;
-      
-      const border = new THREE.Mesh(borderGeometry, borderMaterial);
-      border.position.set(rightX, 0.25, rightZ);
-      border.rotation.y = boxRotationY;
-      border.castShadow = true;
-      this.scene.add(border);
-      this.edges.push(border);
-    }
+
+    borderMesh.instanceMatrix.needsUpdate = true;
+    this.scene.add(borderMesh);
+    this.edges.push(borderMesh);
   }
   
   createOrbEdges(orbX, orbZ, pathwayRotationY) {
@@ -1332,9 +1357,11 @@ export default class MainMuseum {
     
     const portalMaterial = new THREE.PointsMaterial({
       size: 0.5,
+      map: softDotTexture(),
+      alphaTest: 0.02,
       vertexColors: true,
       transparent: true,
-      opacity: 0.8,
+      opacity: 1,
       blending: THREE.AdditiveBlending,
       depthWrite: false,
       sizeAttenuation: true
@@ -1496,44 +1523,36 @@ export default class MainMuseum {
     pCtx.fillRect(0, 0, 32, 32);
     
     const particleTexture = new THREE.CanvasTexture(particleCanvas);
-    const particleMaterial = new THREE.SpriteMaterial({
-      map: particleTexture,
-      transparent: true,
-      blending: THREE.AdditiveBlending,
-      depthWrite: false
-    });
-    
-    // Create particles
+
+    // One point cloud instead of 25 sprites: same particles, one draw call.
+    const field = new ParticleField(particleTexture, particleCount, { size: 0.35 });
+    field.texture = particleTexture;
+
+    const particleData = [];
     for (let i = 0; i < particleCount; i++) {
-      const particle = new THREE.Sprite(particleMaterial.clone());
-      
       // Random starting position in a circle on the floor
       const angle = Math.random() * Math.PI * 2;
       const radius = Math.random() * 0.5;
-      
-      particle.position.x = Math.cos(angle) * radius;
-      particle.position.y = 0;
-      particle.position.z = Math.sin(angle) * radius;
-      
       const scale = 0.2 + Math.random() * 0.3; // Bigger particles (was 0.1-0.25)
-      particle.scale.set(scale, scale, 1);
-      
-      // Store particle data for animation
-      particle.userData = {
+
+      particleData.push({
         velocity: 0.02 + Math.random() * 0.03,
         maxHeight: 3 + Math.random() * 1,
         angle: angle,
         startRadius: radius,
-        resetY: 0,
-        expansionRate: 3 + Math.random() * 2 // More outward spread (was 2)
-      };
-      
-      group.add(particle);
-      particles.push(particle);
+        expansionRate: 3 + Math.random() * 2, // More outward spread (was 2)
+        y: 0
+      });
+
+      field.setPosition(i, Math.cos(angle) * radius, 0, Math.sin(angle) * radius);
+      field.setSize(i, scale);
     }
-    
-    // Store particles array for animation
-    group.userData.particles = particles;
+    field.commit();
+    group.add(field.mesh);
+
+    // Store particle data for animation
+    group.userData.particles = field;
+    group.userData.particleData = particleData;
     group.userData.colorData = colorData;
     
     // Add central bright spot
@@ -2293,10 +2312,15 @@ export default class MainMuseum {
   }
   
   onMouseMove(event) {
-    if (!this.isMouseDown || this.lockCameraRotation) return;
+    // Pointer lock: the cursor is captured, so look follows raw mouse movement
+    // and no button needs to be held.
+    const locked = document.pointerLockElement != null;
+
+    if (this.lockCameraRotation) return;
+    if (!locked && !this.isMouseDown) return;
     
-    const deltaX = event.clientX - this.lastMouseX;
-    const deltaY = event.clientY - this.lastMouseY;
+    const deltaX = locked ? (event.movementX || 0) : event.clientX - this.lastMouseX;
+    const deltaY = locked ? (event.movementY || 0) : event.clientY - this.lastMouseY;
     
     this.cameraRotation.y -= deltaX * this.lookSpeed;
     this.cameraRotation.x -= deltaY * this.lookSpeed;
@@ -2304,8 +2328,10 @@ export default class MainMuseum {
     // Clamp vertical rotation
     this.cameraRotation.x = Math.max(-Math.PI / 2, Math.min(Math.PI / 2, this.cameraRotation.x));
     
-    this.lastMouseX = event.clientX;
-    this.lastMouseY = event.clientY;
+    if (!locked) {
+      this.lastMouseX = event.clientX;
+      this.lastMouseY = event.clientY;
+    }
   }
   
   onMouseUp(event) {
@@ -2370,6 +2396,7 @@ export default class MainMuseum {
   
   animate() {
     this.animationId = requestAnimationFrame(() => this.animate());
+    if (this.adaptive) this.adaptive.sample();
     
     const deltaTime = 0.016; // ~60fps
     this.time += deltaTime;
@@ -2422,30 +2449,34 @@ export default class MainMuseum {
       
       // Animate platform particles - rising effect like Memory Hall
       if (bubble.platform && bubble.platform.userData.particles) {
-        bubble.platform.userData.particles.forEach(particle => {
+        const field = bubble.platform.userData.particles;
+        const data = bubble.platform.userData.particleData || [];
+
+        for (let i = 0; i < data.length; i++) {
+          const p = data[i];
+
           // Move particle upward
-          particle.position.y += particle.userData.velocity;
-          
+          p.y += p.velocity;
+
           // Expand outward as it rises (more dramatic splatter)
-          const progress = particle.position.y / particle.userData.maxHeight;
-          const currentRadius = particle.userData.startRadius + progress * particle.userData.expansionRate;
-          particle.position.x = Math.cos(particle.userData.angle) * currentRadius;
-          particle.position.z = Math.sin(particle.userData.angle) * currentRadius;
-          
+          const progress = p.y / p.maxHeight;
+          const currentRadius = p.startRadius + progress * p.expansionRate;
+          field.setPosition(i, Math.cos(p.angle) * currentRadius, p.y, Math.sin(p.angle) * currentRadius);
+
           // Fade out as it rises
-          particle.material.opacity = 1 - progress;
-          
+          field.setAlpha(i, 1 - progress);
+
           // Reset when reaching max height
-          if (particle.position.y >= particle.userData.maxHeight) {
-            particle.position.y = 0;
-            const newAngle = Math.random() * Math.PI * 2;
-            const newRadius = Math.random() * 0.5;
-            particle.userData.angle = newAngle;
-            particle.userData.startRadius = newRadius;
-            particle.userData.expansionRate = 3 + Math.random() * 2;
-            particle.material.opacity = 1;
+          if (p.y >= p.maxHeight) {
+            p.y = 0;
+            p.angle = Math.random() * Math.PI * 2;
+            p.startRadius = Math.random() * 0.5;
+            p.expansionRate = 3 + Math.random() * 2;
+            field.setAlpha(i, 1);
           }
-        });
+        }
+
+        field.commit(this.camera, this.renderer);
       }
       
       // Animate portal particles - vacuum/black hole effect
@@ -2697,7 +2728,7 @@ export default class MainMuseum {
         // Platform with particles (Group — traverse all children)
         if (bubble.platform) {
           bubble.platform.traverse(child => {
-            if (child.isMesh || child.isSprite) {
+            if (child.isMesh || child.isSprite || child.isPoints) {
               if (child.geometry) child.geometry.dispose();
               if (child.material) {
                 if (child.material.map) child.material.map.dispose();
