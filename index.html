@@ -7,10 +7,14 @@
     <meta name="author" content="Portfolio Owner">
     <title>RetroWalk</title>
     <script>
-      // Set base href only on GitHub Pages, not on localhost
-      if (location.hostname !== 'localhost' && location.hostname !== '127.0.0.1') {
+      // Set base href only when served from the GitHub Pages project sub-path.
+      // Hosts that serve the site from the domain root (Vercel, Netlify, localhost)
+      // must NOT get a base tag, or every relative CSS/JS/asset path 404s.
+      const ghPagesPath = '/NYERK_VR_Memory_Orb_Museum';
+      if (location.pathname === ghPagesPath ||
+          location.pathname.indexOf(ghPagesPath + '/') === 0) {
         const base = document.createElement('base');
-        base.href = '/NYERK_VR_Memory_Orb_Museum/';
+        base.href = ghPagesPath + '/';
         document.head.appendChild(base);
       }
     </script>
