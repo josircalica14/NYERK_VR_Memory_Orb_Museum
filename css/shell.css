@@ -1197,6 +1197,23 @@
   }
 }
 
+/* The HUD cluster needs ~378px. Below that it would run into the Back button,
+   so it drops to its own row rather than shrinking the 44px touch targets. */
+@media (max-width: 560px) {
+  .rw-hud {
+    top: 84px;
+  }
+
+  /* The bar is the first thing to go: the counter stays on one line. */
+  .rw-progress__bar {
+    display: none;
+  }
+
+  .rw-progress__value {
+    white-space: nowrap;
+  }
+}
+
 /* Touch: everything a thumb can reach, at 44px minimum */
 @media (pointer: coarse) {
   .rw-icon-btn {
