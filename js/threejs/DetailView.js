@@ -7,6 +7,7 @@ import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { LoadingScreen } from './LoadingScreen.js';
 import { ParticleField, attachAdaptiveResolution } from './PerfKit.js';
+import { MemoryShell } from './MemoryShell.js';
 
 export class DetailView {
   constructor() {
@@ -195,6 +196,9 @@ export class DetailView {
       });
       this.edges = [];
 
+      // A rebuild of the hall must not inherit the previous build's lights.
+      this.clearHallLights();
+
       // Dimensions for lollipop layout - increased for more spacious feel
       const mainCorridorWidth = 16;
       const mainCorridorLength = 100; // Increased from 80 to 100
@@ -273,7 +277,11 @@ export class DetailView {
       // Add floating title at circle center
       const bubbleName = this.portfolioData?.title || 'Memory';
       const titleText = `${bubbleName}'s Memory Hall`;
-      this.createFloatingTitle(titleText, circleCenter.x, 25, circleCenter.z, this.originalAccentColor);
+      // Height is measured, not decorative: the entrance sightline puts the greeting
+      // bubble's panel across 288..372 px, and the title's letters are half the quad
+      // tall, so anything below ~47 crosses the bubble and the greeting clips the
+      // first word. At 47 the title sits whole above the greeting.
+      this.createFloatingTitle(titleText, circleCenter.x, 47, circleCenter.z, this.originalAccentColor);
 
       // Create hologram platform as part of the Memory Hall structure
       this.createHologramPlatform(this.originalAccentColor);
@@ -779,15 +787,15 @@ export class DetailView {
         ctx.arc(256, 256, 256, 0, Math.PI * 2);
         ctx.closePath();
         ctx.clip();
-        ctx.fillStyle = `rgba(${colorData.rgb[0]}, ${colorData.rgb[1]}, ${colorData.rgb[2]}, 0.35)`;
+        ctx.fillStyle = `rgba(${colorData.rgb[0]}, ${colorData.rgb[1]}, ${colorData.rgb[2]}, 0.28)`;
         ctx.fillRect(0, 0, 512, 512);
         ctx.restore();
         
         // Apply vignette
         const vignette = ctx.createRadialGradient(256, 256, 0, 256, 256, 256);
         vignette.addColorStop(0, 'transparent');
-        vignette.addColorStop(0.4, 'transparent');
-        vignette.addColorStop(0.6, `rgba(${colorData.rgb[0]}, ${colorData.rgb[1]}, ${colorData.rgb[2]}, 0.25)`);
+        vignette.addColorStop(0.52, 'transparent');
+        vignette.addColorStop(0.68, `rgba(${colorData.rgb[0]}, ${colorData.rgb[1]}, ${colorData.rgb[2]}, 0.25)`);
         vignette.addColorStop(0.75, `rgba(${colorData.rgb[0]}, ${colorData.rgb[1]}, ${colorData.rgb[2]}, 0.6)`);
         vignette.addColorStop(0.88, `rgba(${colorData.rgb[0]}, ${colorData.rgb[1]}, ${colorData.rgb[2]}, 0.9)`);
         vignette.addColorStop(1, `rgba(${colorData.rgb[0]}, ${colorData.rgb[1]}, ${colorData.rgb[2]}, 1)`);
@@ -1178,7 +1186,11 @@ export class DetailView {
       orbMaterial = new THREE.SpriteMaterial({
         map: texture,
         transparent: true,
-        blending: THREE.NormalBlending
+        blending: THREE.NormalBlending,
+        // The texture is a circle in a square quad. Without this, the quad's
+        // transparent corners still write depth and punch a dark card out of
+        // anything drawn after the orb (the memory shelf wall).
+        alphaTest: 0.02
       });
       // Outer glow ring (also sprite) - ADD FIRST so it renders behind
       // Create soft, smooth glow like main museum bubbles - MORE NOTICEABLE
@@ -1205,7 +1217,10 @@ export class DetailView {
           transparent: true,
           blending: THREE.AdditiveBlending,
           depthTest: false, // Render behind main orb
-          opacity: 1.0 // Full opacity for more noticeable glow
+          // Without this the glow's square quad writes depth and hides whatever
+          // is drawn after it (the memory wall), leaving a dark card behind each orb.
+          depthWrite: false,
+          opacity: 0.55 // Halo, not a wash: the photo inside the orb is the content
         })
       );
       glowRing.scale.set(orbRadius * 3.0, orbRadius * 3.0, 1); // Reduced radius for tighter glow
@@ -1220,10 +1235,9 @@ export class DetailView {
       orb.renderOrder = 0; // Render after glow
       this.scene.add(orb);
 
-      // Point light for illumination
-      const light = new THREE.PointLight(colorData.hex, 1.8, 15);
-      light.position.set(x, y, z);
-      this.scene.add(light);
+      // The orb used to carry its own PointLight. It tinted the floor by at most
+      // 14/255 across 0.02% of the frame, while every lit fragment in the hall
+      // paid for it in the light loop - so the wash is gone deliberately.
 
       // Create glowing platform below orb
       const platform = this.createOrbPlatform(colorData, rotationY);
@@ -1277,7 +1291,7 @@ export class DetailView {
       this.orbs.push({ 
         mesh: orb, 
         glowRing: glowRing,
-        light: light,
+        light: null,
         platform: platform,
         textSprite: textSprite,
         videoElement: videoElement,
@@ -1732,237 +1746,19 @@ export class DetailView {
    * Optimized with instanced rendering and merged geometries
    */
   createStarfield() {
-    // Create memory orb cube background (Inside Out inspired)
-    // Optimized for performance with instanced rendering
-    
-    const orbShelves = new THREE.Group();
-    
-    // Configuration for orb cube - optimized for performance
-    const cubeConfig = {
-      rows: 6,
-      cols: 10,
-      spacing: 40,
-      orbSize: 10,
-      width: 500,
-      height: 300,
-      depth: 600,
-      centerZ: -100
-    };
-    
-    // Array to store orb data
+    // Inside Out style memory shelf shell: instanced shader orbs, no lights, 4 draw calls.
+    // Corridor spans z 45..-90 and the ring floor is centred at z = -150 (radius 60).
+    if (this.shell) this.shell.dispose();
     this.memoryOrbs = [];
-    
-    // Memory colors with variety
-    const memoryColors = [
-      { r: 255, g: 235, b: 100 },  // Bright yellow
-      { r: 255, g: 200, b: 50 },   // Golden yellow
-      { r: 140, g: 200, b: 255 },  // Light blue
-      { r: 80, g: 140, b: 255 },   // Deep blue
-      { r: 255, g: 140, b: 140 },  // Light red
-      { r: 255, g: 80, b: 80 },    // Bright red
-      { r: 230, g: 140, b: 255 },  // Light purple
-      { r: 180, g: 80, b: 255 },   // Deep purple
-      { r: 140, g: 255, b: 200 },  // Light green
-      { r: 80, g: 255, b: 140 },   // Bright green
-      { r: 255, g: 180, b: 230 },  // Pink
-      { r: 255, g: 140, b: 200 },  // Hot pink
-      { r: 180, g: 240, b: 255 },  // Cyan
-      { r: 200, g: 255, b: 180 },  // Lime
-      { r: 255, g: 200, b: 140 }   // Orange
-    ];
-    
-    // Pre-create textures for each color - simple solid circles
-    const textureCache = {};
-    memoryColors.forEach((color, index) => {
-      const orbCanvas = document.createElement('canvas');
-      orbCanvas.width = 64;
-      orbCanvas.height = 64;
-      const orbCtx = orbCanvas.getContext('2d');
-      
-      orbCtx.clearRect(0, 0, 64, 64);
-      
-      // Simple solid circle
-      orbCtx.fillStyle = `rgb(${color.r}, ${color.g}, ${color.b})`;
-      orbCtx.beginPath();
-      orbCtx.arc(32, 32, 30, 0, Math.PI * 2);
-      orbCtx.fill();
-      
-      const texture = new THREE.CanvasTexture(orbCanvas);
-      texture.needsUpdate = true;
-      textureCache[index] = texture;
+    this.shell = new MemoryShell({
+      halfWidth: 72,        // straight-wall distance from the centre line
+      endRadius: 88,        // round end: ring floor radius is 60, so the wall keeps 28 units of air
+      flare: 20,            // smooth swing from the corridor walls out into the round room
+      zOpen: 100,           // open front, behind the entrance
+      zEnd: -222,           // round end centred on the ring centre (z = -150)
+      shelfColor: 0xf79c00
     });
-    
-    // Create orbs using instanced rendering for better performance
-    const halfWidth = cubeConfig.width / 2;
-    const halfHeight = cubeConfig.height / 2;
-    const halfDepth = cubeConfig.depth / 2;
-    
-    // Calculate total orb count
-    const leftWallCount = cubeConfig.rows * cubeConfig.cols;
-    const rightWallCount = cubeConfig.rows * cubeConfig.cols;
-    const backCols = Math.floor(cubeConfig.width / cubeConfig.spacing) - 2;
-    const backWallCount = cubeConfig.rows * backCols;
-    const totalOrbs = leftWallCount + rightWallCount + backWallCount;
-    
-    // Create one sprite per color for instancing
-    const orbsByColor = {};
-    memoryColors.forEach((color, index) => {
-      orbsByColor[index] = [];
-    });
-    
-    // Helper to add orb position
-    const addOrbPosition = (x, y, z) => {
-      const colorIndex = Math.floor(Math.random() * memoryColors.length);
-      orbsByColor[colorIndex].push({ x, y, z });
-    };
-    
-    // LEFT WALL
-    for (let row = 0; row < cubeConfig.rows; row++) {
-      for (let col = 0; col < cubeConfig.cols; col++) {
-        const y = (row - cubeConfig.rows / 2) * cubeConfig.spacing;
-        const z = cubeConfig.centerZ + halfDepth - (col * (cubeConfig.depth / (cubeConfig.cols - 1)));
-        addOrbPosition(-halfWidth + (Math.random() - 0.5) * 2, y, z);
-      }
-    }
-    
-    // RIGHT WALL
-    for (let row = 0; row < cubeConfig.rows; row++) {
-      for (let col = 0; col < cubeConfig.cols; col++) {
-        const y = (row - cubeConfig.rows / 2) * cubeConfig.spacing;
-        const z = cubeConfig.centerZ + halfDepth - (col * (cubeConfig.depth / (cubeConfig.cols - 1)));
-        addOrbPosition(halfWidth + (Math.random() - 0.5) * 2, y, z);
-      }
-    }
-    
-    // BACK WALL
-    for (let row = 0; row < cubeConfig.rows; row++) {
-      for (let col = 0; col < backCols; col++) {
-        const x = -halfWidth + (col * (cubeConfig.width / (backCols - 1)));
-        const y = (row - cubeConfig.rows / 2) * cubeConfig.spacing;
-        addOrbPosition(x, y, cubeConfig.centerZ - halfDepth + (Math.random() - 0.5) * 3);
-      }
-    }
-    
-    // Create sprites for each color group
-    Object.keys(orbsByColor).forEach(colorIndex => {
-      const positions = orbsByColor[colorIndex];
-      if (positions.length === 0) return;
-      
-      const texture = textureCache[colorIndex];
-      const material = new THREE.SpriteMaterial({
-        map: texture,
-        transparent: false,
-        blending: THREE.NormalBlending
-      });
-      
-      // Create individual sprites (Three.js doesn't support instanced sprites)
-      positions.forEach(pos => {
-        const sprite = new THREE.Sprite(material);
-        sprite.scale.set(cubeConfig.orbSize, cubeConfig.orbSize, 1);
-        sprite.position.set(pos.x, pos.y, pos.z);
-        sprite.frustumCulled = true; // Enable frustum culling
-        orbShelves.add(sprite);
-      });
-    });
-    
-    // Add shelf lines below each row of orbs
-    const shelfMaterial = new THREE.LineBasicMaterial({
-      color: 0xF79C00, // Brighter amber/yellow edge color
-      transparent: false,
-      opacity: 1.0,
-      linewidth: 2
-    });
-    
-    // Left wall shelves - stop exactly where rounded corner begins
-    const shelfCornerRadius = 60; // Increased for more rounded corners
-    for (let row = 0; row < cubeConfig.rows; row++) {
-      const rowY = (row - cubeConfig.rows / 2) * cubeConfig.spacing - 6;
-      const points = [];
-      
-      const cornerStartZ = cubeConfig.centerZ - halfDepth + shelfCornerRadius;
-      
-      // Add points from front to where corner starts
-      for (let col = 0; col <= cubeConfig.cols; col++) {
-        const colZ = cubeConfig.centerZ + halfDepth - (col * (cubeConfig.depth / cubeConfig.cols));
-        if (colZ >= cornerStartZ) {
-          points.push(new THREE.Vector3(-halfWidth, rowY, colZ));
-        }
-      }
-      
-      // Ensure we end exactly at corner start
-      if (points.length > 0 && points[points.length - 1].z > cornerStartZ) {
-        points.push(new THREE.Vector3(-halfWidth, rowY, cornerStartZ));
-      }
-      
-      const geometry = new THREE.BufferGeometry().setFromPoints(points);
-      const line = new THREE.Line(geometry, shelfMaterial);
-      orbShelves.add(line);
-    }
-    
-    // Right wall shelves - stop exactly where rounded corner begins
-    for (let row = 0; row < cubeConfig.rows; row++) {
-      const rowY = (row - cubeConfig.rows / 2) * cubeConfig.spacing - 6;
-      const points = [];
-      
-      const cornerStartZ = cubeConfig.centerZ - halfDepth + shelfCornerRadius;
-      
-      // Add points from front to where corner starts
-      for (let col = 0; col <= cubeConfig.cols; col++) {
-        const colZ = cubeConfig.centerZ + halfDepth - (col * (cubeConfig.depth / cubeConfig.cols));
-        if (colZ >= cornerStartZ) {
-          points.push(new THREE.Vector3(halfWidth, rowY, colZ));
-        }
-      }
-      
-      // Ensure we end exactly at corner start
-      if (points.length > 0 && points[points.length - 1].z > cornerStartZ) {
-        points.push(new THREE.Vector3(halfWidth, rowY, cornerStartZ));
-      }
-      
-      const geometry = new THREE.BufferGeometry().setFromPoints(points);
-      const line = new THREE.Line(geometry, shelfMaterial);
-      orbShelves.add(line);
-    }
-    
-    // Back wall shelves with rounded corners - optimized
-    const backShelfCols = Math.floor(cubeConfig.width / cubeConfig.spacing);
-    for (let row = 0; row < cubeConfig.rows; row++) {
-      const rowY = (row - cubeConfig.rows / 2) * cubeConfig.spacing - 6;
-      const points = [];
-      
-      // Left rounded corner - reduced steps for better performance
-      const cornerSteps = 10; // Reduced from 16 for performance
-      for (let step = 0; step <= cornerSteps; step++) {
-        const angle = (step / cornerSteps) * (Math.PI / 2);
-        const x = -halfWidth + shelfCornerRadius * (1 - Math.cos(angle));
-        const z = cubeConfig.centerZ - halfDepth + shelfCornerRadius * (1 - Math.sin(angle));
-        points.push(new THREE.Vector3(x, rowY, z));
-      }
-      
-      // Straight section across back wall - fewer points
-      const startX = -halfWidth + shelfCornerRadius;
-      const endX = halfWidth - shelfCornerRadius;
-      const backPoints = 6; // Fixed number for consistent performance
-      for (let i = 0; i <= backPoints; i++) {
-        const x = startX + (i / backPoints) * (endX - startX);
-        points.push(new THREE.Vector3(x, rowY, cubeConfig.centerZ - halfDepth));
-      }
-      
-      // Right rounded corner
-      for (let step = 0; step <= cornerSteps; step++) {
-        const angle = (step / cornerSteps) * (Math.PI / 2);
-        const x = halfWidth - shelfCornerRadius * (1 - Math.sin(angle));
-        const z = cubeConfig.centerZ - halfDepth + shelfCornerRadius * (1 - Math.cos(angle));
-        points.push(new THREE.Vector3(x, rowY, z));
-      }
-      
-      const geometry = new THREE.BufferGeometry().setFromPoints(points);
-      const line = new THREE.Line(geometry, shelfMaterial);
-      orbShelves.add(line);
-    }
-    
-    this.scene.add(orbShelves);
-    this.orbShelves = orbShelves;
+    this.scene.add(this.shell.group);
   }
 
   /**
@@ -2103,10 +1899,8 @@ export class DetailView {
     // Create animated particles flowing into the door
     this.createDoorParticles(doorWidth, doorHeight, floatHeight, tBarBackZ);
     
-    // Floating title in the sky above the hall
-    const bubbleName = this.portfolioData?.title || 'Memory';
-    const titleText = `${bubbleName}'s Memory Hall`;
-    this.createFloatingTitle(titleText, 0, 25, tBarBackZ + 10, this.accentColor);
+    // The hall title is created once in createMemoryHall; a second call here
+    // landed on the same spot and drew a duplicate quad over it.
   }
 
   /**
@@ -2336,6 +2130,20 @@ export class DetailView {
    * Create floating 3D glowing title with depth
    */
   createFloatingTitle(text, x, y, z, color) {
+    // A rebuilt hall used to stack a second plate on the old one at the same
+    // spot and leak its 2048x512 texture, so drop the previous title first.
+    if (this.titleSprite && this.titleSprite.sprite) {
+      this.titleSprite.sprite.removeFromParent();
+      this.titleSprite.sprite.traverse(o => {
+        if (o.geometry) o.geometry.dispose();
+        if (o.material) {
+          if (o.material.map) o.material.map.dispose();
+          o.material.dispose();
+        }
+      });
+      this.titleSprite = null;
+    }
+
     // Create canvas for text texture with higher resolution
     const canvas = document.createElement('canvas');
     canvas.width = 2048;
@@ -2345,13 +2153,15 @@ export class DetailView {
     // Clear canvas with transparency
     ctx.clearRect(0, 0, 2048, 512);
     
-    // Dynamically adjust font size based on text length
-    let fontSize = 140;
+    // Dynamically adjust font size based on text length. The letters are drawn at
+    // 80% of the canvas so the halo below has room to spread before the edge;
+    // the quad is scaled to match, so the letters stay the same size on screen.
+    let fontSize = 128;
     ctx.font = `bold ${fontSize}px Arial`;
     let textMetrics = ctx.measureText(text);
     
     // If text is too wide, reduce font size
-    const maxWidth = 1900; // Leave some padding
+    const maxWidth = 1560; // Leave room for the outer glow
     while (textMetrics.width > maxWidth && fontSize > 60) {
       fontSize -= 5;
       ctx.font = `bold ${fontSize}px Arial`;
@@ -2366,96 +2176,80 @@ export class DetailView {
     const r = parseInt(colorHex.slice(0, 2), 16);
     const g = parseInt(colorHex.slice(2, 4), 16);
     const b = parseInt(colorHex.slice(4, 6), 16);
+
+    // No plate behind the letters: the title is floating text only, so nothing
+    // sits between the letters and the shelf wall and there is no panel to read
+    // differently from range than up close.
     
-    // Multiple glow layers for depth
-    ctx.shadowBlur = 50;
-    ctx.shadowColor = `rgba(${r}, ${g}, ${b}, 0.8)`;
-    ctx.fillStyle = `rgba(${r}, ${g}, ${b}, 0.3)`;
+    // Halo: one wide, faint pass, baked here rather than added as a second
+    // additive quad, so the glow costs nothing per frame - still one quad, one
+    // texture, one draw call, and no extra light or bloom pass in the hall.
+    ctx.shadowBlur = 68;
+    ctx.shadowColor = `rgba(${r}, ${g}, ${b}, 0.55)`;
+    ctx.fillStyle = `rgba(${r}, ${g}, ${b}, 0.16)`;
+    ctx.fillText(text, 1024, 256);
+
+    // Second, tighter halo pass so the falloff is a gradient rather than one
+    // flat wash - the wall behind the title is busy, and a single gaussian
+    // disappears into the orbs at mid-corridor distance.
+    ctx.shadowBlur = 40;
+    ctx.shadowColor = `rgba(${r}, ${g}, ${b}, 0.7)`;
+    ctx.fillStyle = `rgba(${r}, ${g}, ${b}, 0.18)`;
+    ctx.fillText(text, 1024, 256);
+
+    // Glow layers: tight enough that the letters stay letters at hall distance
+    ctx.shadowBlur = 26;
+    ctx.shadowColor = `rgba(${r}, ${g}, ${b}, 0.75)`;
+    ctx.fillStyle = `rgba(${r}, ${g}, ${b}, 0.35)`;
     ctx.fillText(text, 1024, 256);
     
-    ctx.shadowBlur = 30;
+    ctx.shadowBlur = 14;
     ctx.shadowColor = `rgba(${r}, ${g}, ${b}, 1)`;
     ctx.fillStyle = `rgba(${r}, ${g}, ${b}, 0.6)`;
     ctx.fillText(text, 1024, 256);
     
     // Bright white core
-    ctx.shadowBlur = 15;
-    ctx.shadowColor = 'rgba(255, 255, 255, 1)';
-    ctx.fillStyle = 'rgba(255, 255, 255, 0.95)';
+    ctx.shadowBlur = 8;
+    ctx.shadowColor = 'rgba(255, 255, 255, 0.9)';
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.97)';
     ctx.fillText(text, 1024, 256);
     
     // Create texture
     const texture = new THREE.CanvasTexture(canvas);
     texture.needsUpdate = true;
     
-    // Create 3D depth effect by layering multiple planes - reduced for performance
-    const textWidth = 70; // Increased from 50
-    const textHeight = 16; // Increased from 12
-    const depthLayers = 4; // Reduced from 8 to 4 for better performance
-    const layerSpacing = 0.2; // Slightly increased spacing to maintain depth perception
-    
-    const textGroup = new THREE.Group();
-    
-    // Create back layers (darker, for depth)
-    for (let i = depthLayers - 1; i >= 0; i--) {
-      const layerGeometry = new THREE.PlaneGeometry(textWidth, textHeight);
-      const opacity = 0.3 + (i / depthLayers) * 0.7; // Fade from back to front
-      
-      // Use NormalBlending for front layer to preserve white color
-      const blendMode = i === 0 ? THREE.NormalBlending : THREE.AdditiveBlending;
-      
-      const layerMaterial = new THREE.MeshBasicMaterial({
-        map: i === 0 ? texture : texture.clone(),
+    // One quad, one texture, no lights. The letter glow is already baked into the
+    // canvas, so the old layer loop and the three PointLights only cost shader
+    // work on every lit surface in the hall for floor spill that is invisible
+    // from title height.
+    const titleMesh = new THREE.Mesh(
+      // 25% larger than the letters need, which is the halo's room; the canvas
+      // draws the text correspondingly smaller so the type reads the same size.
+      new THREE.PlaneGeometry(104, 23.8),
+      new THREE.MeshBasicMaterial({
+        map: texture,
         transparent: true,
         side: THREE.DoubleSide,
-        blending: blendMode,
-        depthWrite: false,
-        opacity: i === 0 ? 1.0 : opacity // Front layer full opacity
-      });
-      
-      const layerMesh = new THREE.Mesh(layerGeometry, layerMaterial);
-      layerMesh.position.z = -i * layerSpacing; // Stack layers back
-      
-      // Add slight color tint ONLY to back layers (not the front layer i===0)
-      if (i > 0) {
-        layerMaterial.color.setRGB(
-          r / 255 * (0.5 + i / depthLayers * 0.5),
-          g / 255 * (0.5 + i / depthLayers * 0.5),
-          b / 255 * (0.5 + i / depthLayers * 0.5)
-        );
-      } else {
-        // Front layer stays pure white - no color tinting
-        layerMaterial.color.setRGB(1, 1, 1);
-      }
-      
-      textGroup.add(layerMesh);
-    }
-    
+        depthWrite: false
+      })
+    );
+    // The shelf orbs and their glows are transparent too, and from the entrance
+    // their depth sort put them in front of the letters, speckling the title with
+    // orbs that are actually behind it. Draw the title after them; depth test
+    // still hides it behind anything genuinely in front.
+    titleMesh.renderOrder = 5;
+
+    const textGroup = new THREE.Group();
+    textGroup.add(titleMesh);
     textGroup.position.set(x, y, z);
     this.scene.add(textGroup);
-    
-    // Add stronger point light behind text for extra glow
-    const textLight = new THREE.PointLight(color, 5.0, 30);
-    textLight.position.set(x, y, z - 2);
-    this.scene.add(textLight);
-    
-    // Add rim lights on sides for 3D effect
-    const leftLight = new THREE.PointLight(color, 2.5, 20);
-    leftLight.position.set(x - 20, y, z);
-    this.scene.add(leftLight);
-    
-    const rightLight = new THREE.PointLight(color, 2.5, 20);
-    rightLight.position.set(x + 20, y, z);
-    this.scene.add(rightLight);
-    
+
     // Add floating animation
     const floatOffset = Math.random() * Math.PI * 2;
-    this.titleSprite = { 
-      sprite: textGroup, 
-      baseY: y, 
-      floatOffset: floatOffset, 
-      light: textLight,
-      rimLights: [leftLight, rightLight]
+    this.titleSprite = {
+      sprite: textGroup,
+      baseY: y,
+      floatOffset: floatOffset
     };
   }
 
@@ -2489,6 +2283,28 @@ export class DetailView {
    * Show the detail view with loading screen
    */
   async show(accentColor, portfolioData = null) {
+    // Two entry paths (the hall deep link and the intro's Start button) can land
+    // in the same tick. Both used to run the whole build at once: two white
+    // fades, two halls, and a second copy of every light (69 instead of 38).
+    // The hall already on its way in wins; a different hall waits its turn.
+    const target = (portfolioData && portfolioData.folder) || null;
+    if (this._showInFlight) {
+      if (target !== this._showTarget) this._queuedShow = [accentColor, portfolioData];
+      return;
+    }
+    this._showInFlight = true;
+    this._showTarget = target;
+    try {
+      await this._showHall(accentColor, portfolioData);
+    } finally {
+      this._showInFlight = false;
+      const queued = this._queuedShow;
+      this._queuedShow = null;
+      if (queued) this.show(queued[0], queued[1]);
+    }
+  }
+
+  async _showHall(accentColor, portfolioData = null) {
     console.log('DetailView.show called with:', accentColor, portfolioData);
     
     // Store portfolio data for returning to correct position
@@ -2577,7 +2393,8 @@ export class DetailView {
     // POV hand
     this.createPOVHand();
 
-    this.animate();
+    // Start the loop only if it is not already running (re-entering the hall)
+    if (!this._animating) this.animate();
     
     // Show chibi welcome screen immediately (platform visible right away)
     this.showChibiWelcome();
@@ -2741,6 +2558,10 @@ export class DetailView {
       });
       
       this.welcomeHologram = new THREE.Sprite(material);
+      // The title carries renderOrder 5 so the shelf orbs cannot speckle it. The
+      // hologram stands 29 units in front of it, so it has to draw after the
+      // title or the letters show straight through the chibi and his bubble.
+      this.welcomeHologram.renderOrder = 6;
       
       // Position hologram on the floor like a welcome staff/bot (left side of entrance)
       const hologramX = -6;
@@ -2777,12 +2598,16 @@ export class DetailView {
         const bubbleWidth = 400;
         const bubbleHeight = 180;
         const bubbleX = (bubbleCanvas.width - bubbleWidth) / 2;
-        const bubbleY = 120;
+        // Sits just above the chibi's head with its tail reaching down to him.
+        // The bubble draws over the hall title (renderOrder 6), so it covers the
+        // letters behind it instead of the two crossing each other.
+        const bubbleY = 115;
         const bubbleRadius = 20;
         const tailSize = 30;
         
-        // Draw frosted glass effect background
-        bubbleCtx.fillStyle = 'rgba(0, 20, 40, 0.7)';
+        // Draw frosted glass effect background. Near-opaque on purpose: the hall
+        // title sits behind this panel and letter-high ghosting read as a bug.
+        bubbleCtx.fillStyle = 'rgba(0, 20, 40, 0.92)';
         this.roundRect(bubbleCtx, bubbleX, bubbleY, bubbleWidth, bubbleHeight, bubbleRadius);
         bubbleCtx.fill();
         
@@ -2895,6 +2720,9 @@ export class DetailView {
       const bubbleDuration = 0.6; // Bubble fades in over 0.6s
       
       this.welcomeHologramAnimation = () => {
+        // The chibi texture and the mesh can resolve in either order; retry next frame
+        // instead of throwing out of animate() and skipping the render call.
+        if (!this.welcomeHologram) return;
         const elapsed = this.time - startTime;
         
         // Phase 1: Fade in chibi and name (0 to chibiDuration)
@@ -2982,18 +2810,6 @@ export class DetailView {
         if (this.titleSprite.sprite.geometry) {
           this.titleSprite.sprite.geometry.dispose();
         }
-      }
-      
-      // Remove main light
-      if (this.titleSprite.light) {
-        this.scene.remove(this.titleSprite.light);
-      }
-      
-      // Remove rim lights
-      if (this.titleSprite.rimLights) {
-        this.titleSprite.rimLights.forEach(light => {
-          this.scene.remove(light);
-        });
       }
       
       this.titleSprite = null;
@@ -3203,13 +3019,26 @@ export class DetailView {
     }
 
     // Remove all lights from previous hall
+    this.clearHallLights();
+  }
+
+  /**
+   * Drop every light the hall owns. The three global lights belong to init().
+   * Floor and edge cleanup did not know about the corner, arc and platform
+   * lights, so a second build used to keep the first build's copy of them and
+   * the hall rendered with twice the lights (69 instead of 38).
+   */
+  clearHallLights() {
     const lightsToRemove = [];
     this.scene.traverse((object) => {
-      if (object instanceof THREE.Light && !(object instanceof THREE.AmbientLight) && !(object instanceof THREE.DirectionalLight) && !(object instanceof THREE.HemisphereLight)) {
+      if (object.isLight && !object.isAmbientLight && !object.isDirectionalLight && !object.isHemisphereLight) {
         lightsToRemove.push(object);
       }
     });
-    lightsToRemove.forEach(light => this.scene.remove(light));
+    lightsToRemove.forEach(light => light.removeFromParent());
+    if (this.welcomePlatformLight && !this.welcomePlatformLight.parent) {
+      this.welcomePlatformLight = null;
+    }
   }
 
   /**
@@ -4112,7 +3941,11 @@ export class DetailView {
     document.head.appendChild(style);
   }
   createPOVHand() {
+    // Built once. Rebuilding on every show() left two hands in the overlay scene,
+    // because each pending glTF callback added its pivot to the newest handScene.
+    if (this.handScene) return;
     this.handScene = new THREE.Scene();
+    const handScene = this.handScene;
     this.handCamera = new THREE.PerspectiveCamera(45, this.container.clientWidth / this.container.clientHeight, 0.1, 100);
     this.handCamera.position.set(0, 0, 4);
 
@@ -4166,7 +3999,7 @@ export class DetailView {
         pivot.rotation.z = 4.7;
         pivot.position.set(1.2, -0.3, 0);
 
-        this.handScene.add(pivot);
+        handScene.add(pivot);
         this.povHand = pivot;
         this.povHandBaseY = -1.2;
         this.povHandBaseX = 1.5;
@@ -4599,8 +4432,9 @@ export class DetailView {
    * Animation loop
    */
   animate() {
-    if (!this.isActive) return;
+    if (!this.isActive) { this._animating = false; return; }
 
+    this._animating = true; // tells show() not to start a second rAF chain
     this.animationFrameId = requestAnimationFrame(this.animate);
     if (this.adaptive) this.adaptive.sample();
     
@@ -4676,7 +4510,7 @@ export class DetailView {
         const floatY = orb.baseY + Math.sin(this.time * 1.5 + offset) * 0.15;
         orb.mesh.position.y = floatY;
         orb.glowRing.position.y = floatY;
-        orb.light.position.y = floatY;
+        if (orb.light) orb.light.position.y = floatY;
         // Sprites automatically face camera, no need for lookAt
       }
       
@@ -4790,15 +4624,14 @@ export class DetailView {
     if (this.titleSprite) {
       const floatY = this.titleSprite.baseY + Math.sin(this.time * 0.5 + this.titleSprite.floatOffset) * 0.15;
       this.titleSprite.sprite.position.y = floatY;
-      if (this.titleSprite.light) {
-        this.titleSprite.light.position.y = floatY;
-      }
-      // Animate rim lights
-      if (this.titleSprite.rimLights) {
-        this.titleSprite.rimLights.forEach(light => {
-          light.position.y = floatY;
-        });
-      }
+      // The title is a flat quad, so from the shelves it was edge-on and simply
+      // not there. Turn it to the camera on yaw only: readable from anywhere on
+      // the floor, still upright, and unchanged when read from the corridor.
+      const titlePosition = this.titleSprite.sprite.position;
+      this.titleSprite.sprite.rotation.y = Math.atan2(
+        this.camera.position.x - titlePosition.x,
+        this.camera.position.z - titlePosition.z
+      );
     }
 
     // Animate memory orbs - removed pulsing for better performance
@@ -4866,6 +4699,9 @@ export class DetailView {
     if (this.welcomeHologramAnimation) {
       this.welcomeHologramAnimation();
     }
+
+    // Memory shell animation (orb swirl, shelf wave, dust)
+    if (this.shell) this.shell.update(this.time);
 
     // Render
     this.renderer.render(this.scene, this.camera);
@@ -5074,11 +4910,6 @@ export class DetailView {
         }
       }
       
-      if (this.titleSprite.light) this.scene.remove(this.titleSprite.light);
-      if (this.titleSprite.rimLights) {
-        this.titleSprite.rimLights.forEach(light => this.scene.remove(light));
-      }
-      
       this.titleSprite = null;
     }
     
@@ -5107,22 +4938,9 @@ export class DetailView {
     }
     
     // Cleanup memory orb shelves (sprites and lines)
-    if (this.orbShelves) {
-      this.orbShelves.traverse((child) => {
-        if (child instanceof THREE.Sprite) {
-          // Cleanup sprite
-          if (child.material) {
-            if (child.material.map) child.material.map.dispose();
-            child.material.dispose();
-          }
-        } else if (child instanceof THREE.Line) {
-          // Cleanup shelf lines
-          if (child.geometry) child.geometry.dispose();
-          if (child.material) child.material.dispose();
-        }
-      });
-      this.scene.remove(this.orbShelves);
-      this.orbShelves = null;
+    if (this.shell) {
+      this.shell.dispose();
+      this.shell = null;
     }
     if (this.memoryOrbs) {
       this.memoryOrbs = [];
