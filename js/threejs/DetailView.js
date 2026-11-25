@@ -698,9 +698,33 @@ export class DetailView {
     water.renderOrder = 1; // under the cyclone, which draws at 2
     this.scene.add(water);
 
+    // Light the pool throws onto the floor around it. The ring floor is a flat
+    // unlit panel, so without this the fountain sits in a hole with a hard edge
+    // instead of lighting the room it is in: one additive quad with a radial
+    // gradient, no light added to the scene's shader cost.
+    const spillCanvas = document.createElement('canvas');
+    spillCanvas.width = spillCanvas.height = 128;
+    const spillCtx = spillCanvas.getContext('2d');
+    const spill = spillCtx.createRadialGradient(64, 64, 0, 64, 64, 64);
+    spill.addColorStop(0, 'rgba(150, 96, 255, 0.34)');
+    spill.addColorStop(0.42, 'rgba(96, 60, 190, 0.17)');
+    spill.addColorStop(0.72, 'rgba(52, 30, 110, 0.06)');
+    spill.addColorStop(1, 'rgba(30, 16, 60, 0)');
+    spillCtx.fillStyle = spill;
+    spillCtx.fillRect(0, 0, 128, 128);
+    const spillMesh = new THREE.Mesh(
+      new THREE.PlaneGeometry(radius * 4.6, radius * 4.6),
+      new THREE.MeshBasicMaterial({ map: new THREE.CanvasTexture(spillCanvas), transparent: true,
+        depthWrite: false, blending: THREE.AdditiveBlending, side: THREE.DoubleSide })
+    );
+    spillMesh.rotation.x = -Math.PI / 2;
+    spillMesh.position.set(cx, surfaceY - 0.02, cz);
+    spillMesh.renderOrder = 0; // under the water and the cyclone
+    this.scene.add(spillMesh);
+
     this.floorFountain = {
       center: new THREE.Vector3(cx, surfaceY, cz),
-      meshes: [bottom, water],
+      meshes: [bottom, water, spillMesh],
       waterCanvas,
       waterTexture,
       drawWater
