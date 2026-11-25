@@ -288,8 +288,424 @@ export class DetailView {
       
       // Create memory orb cube background
       this.createStarfield();
+
+      // The floor hole becomes the main hall's fountain basin.
+      this.createFloorFountain(circleCenter);
+
+      // The floor hole's cyclone of memory light.
+      this.createMemoryCyclone(circleCenter);
     }
 
+
+  /**
+   * A cyclone of memory light climbing out of the floor hole, in the same five
+   * colours the ring orbs use.
+   *
+   * One Points draw call, animated entirely in the vertex shader - the CPU only
+   * advances a single uniform each frame. The column climbs to y 40 so its
+   * bright edge dies out just under the floating title's glowing letters, with
+   * the fade squeezed into the last tenth of the climb.
+   */
+  createMemoryCyclone(circleCenter) {
+    const count = 200;
+    const baseY = 0.2; // the fountain water surface, not the void below it
+    // Top at 40. The title quad's bottom edge is at 35.24, but the quad carries
+    // transparent padding: the glowing letters end well above it, and that glow
+    // is what the eye reads as "the bottom of the title". The sprite radius adds
+    // roughly another world unit above the highest particle centre, so 40 puts
+    // the bright edge of the column ~20px under the glow at the entrance and
+    // ~10px under it from the ring.
+    const height = 39.8;
+    const colors = [0xF79C00, 0x0066FF, 0x00FF66, 0x9900FF, 0xFF0099];
+
+    const positions = new Float32Array(count * 3);
+    const colorAttr = new Float32Array(count * 3);
+    const seed = new Float32Array(count * 4);
+    const color = new THREE.Color();
+
+    for (let i = 0; i < count; i++) {
+      seed[i * 4] = Math.random();                    // spread from the axis
+      seed[i * 4 + 1] = 0.02 + Math.random() * 0.035; // climb speed
+      seed[i * 4 + 2] = Math.random();                // phase around the spiral
+      seed[i * 4 + 3] = 0.5 + Math.random() * 0.9;    // world size
+
+      color.setHex(colors[i % colors.length]);
+      colorAttr[i * 3] = color.r;
+      colorAttr[i * 3 + 1] = color.g;
+      colorAttr[i * 3 + 2] = color.b;
+    }
+
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geometry.setAttribute('aColor', new THREE.BufferAttribute(colorAttr, 3));
+    geometry.setAttribute('aSeed', new THREE.BufferAttribute(seed, 4));
+
+    const material = new THREE.ShaderMaterial({
+      uniforms: {
+        uTime: { value: 0 },
+        uCenter: { value: new THREE.Vector2(circleCenter.x, circleCenter.z) },
+        uBaseY: { value: baseY },
+        uHeight: { value: height },
+        uPixelScale: { value: 950 },
+        uPixelRatio: { value: Math.min(window.devicePixelRatio || 1, 2) }
+      },
+      vertexShader: `
+        attribute vec3 aColor;
+        attribute vec4 aSeed;
+        uniform float uTime;
+        uniform vec2 uCenter;
+        uniform float uBaseY;
+        uniform float uHeight;
+        uniform float uPixelScale;
+        uniform float uPixelRatio;
+        varying vec3 vColor;
+        varying float vAlpha;
+
+        void main() {
+          float t = fract(uTime * aSeed.y + aSeed.z);
+          float radius = 0.55 + aSeed.x * 3.0 + t * 1.6;
+          float angle = aSeed.z * 6.2831853 + t * 15.708;
+          vec3 pos = vec3(
+            uCenter.x + cos(angle) * radius,
+            uBaseY + t * uHeight,
+            uCenter.y + sin(angle) * radius
+          );
+
+          // Fade in out of the dark, and die out well below the title.
+          float fadeIn = smoothstep(0.0, 0.04, t);
+          float fadeOut = 1.0 - smoothstep(0.90, 1.0, t);
+          vAlpha = fadeIn * fadeOut;
+          vColor = aColor;
+
+          vec4 mv = modelViewMatrix * vec4(pos, 1.0);
+          gl_PointSize = min(aSeed.w * uPixelRatio * (uPixelScale / -mv.z), 44.0);
+          gl_Position = projectionMatrix * mv;
+        }
+      `,
+      fragmentShader: `
+        varying vec3 vColor;
+        varying float vAlpha;
+
+        void main() {
+          float d = length(gl_PointCoord - vec2(0.5));
+          if (d > 0.5) discard;
+          float soft = smoothstep(0.5, 0.05, d);
+          gl_FragColor = vec4(vColor, soft * vAlpha);
+        }
+      `,
+      transparent: true,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false
+    });
+
+    const points = new THREE.Points(geometry, material);
+    points.frustumCulled = false; // positions are computed in the shader
+    points.renderOrder = 2;
+    points.position.set(0, 0, 0);
+    this.scene.add(points);
+
+    this.cyclone = { points, geometry, material };
+  }
+
+  /**
+   * The ring's centre pool: the drifting rainbow water from the main hall's
+   * fountain, with the basin shell left off - no walls, no coping ring, no amber
+   * border of its own.
+   *
+   * Two draw calls: a dark pool floor and the surface floating in the hole above
+   * it. The hall's existing amber hole edge is the only rim it gets, so the pool
+   * reads as sitting in the opening rather than as a structure built into it.
+   */
+  createFloorFountain(circleCenter) {
+    const cx = circleCenter.x;
+    const cz = circleCenter.z;
+    // The floor's hole is r 20 and the amber edge bar around it glows 0.25 wide
+    // at y 0.25; 19.75 is the largest surface that still tucks under that bar.
+    const radius = 19.75;
+    // Just above the hall floor (y 0.1): any lower and the surface is only
+    // visible edge-on from the entrance, at 195 units away.
+    const surfaceY = 0.13;
+
+    // Pool floor: a dark violet bed. Unlit on purpose - it is mostly covered by
+    // the water, so it only has to give the additive surface something to sit
+    // over and stop the void showing through.
+    const bedCanvas = document.createElement('canvas');
+    bedCanvas.width = 128;
+    bedCanvas.height = 128;
+    const bedCtx = bedCanvas.getContext('2d');
+    const bed = bedCtx.createRadialGradient(64, 64, 0, 64, 64, 64);
+    bed.addColorStop(0, 'rgba(64, 34, 104, 1)');
+    bed.addColorStop(0.6, 'rgba(38, 20, 64, 1)');
+    bed.addColorStop(1, 'rgba(16, 8, 30, 1)');
+    bedCtx.fillStyle = bed;
+    bedCtx.fillRect(0, 0, 128, 128);
+
+    const bedTexture = new THREE.CanvasTexture(bedCanvas);
+    const bottomMat = new THREE.MeshBasicMaterial({
+      map: bedTexture,
+      side: THREE.DoubleSide
+    });
+    // Slightly smaller than the water so the bed's own edge never shows as a
+    // second ring just outside the surface's faded rim.
+    const bottom = new THREE.Mesh(new THREE.CircleGeometry(radius - 0.5, 64), bottomMat);
+    bottom.rotation.x = -Math.PI / 2;
+    bottom.position.set(cx, surfaceY - 0.45, cz);
+    this.scene.add(bottom);
+
+    // Rainbow water: the hall's own five memory colours, drifting like the main
+    // hall's fountain surface.
+    const waterRgb = [0xF79C00, 0x0066FF, 0x00FF66, 0x9900FF, 0xFF0099].map(hex => {
+      const c = new THREE.Color(hex);
+      return [Math.floor(c.r * 255), Math.floor(c.g * 255), Math.floor(c.b * 255)];
+    });
+
+    // A soft dot tinted once per memory colour, so the spiral arms are stamped
+    // with drawImage. Filling a gradient per arm dot, or blurring the 2D context
+    // to soften them, costs an order of magnitude more per redraw.
+    const makeStamp = (rgb) => {
+      const size = 64;
+      const stamp = document.createElement('canvas');
+      stamp.width = size;
+      stamp.height = size;
+      const sctx = stamp.getContext('2d');
+      const grad = sctx.createRadialGradient(
+        size / 2, size / 2, 0, size / 2, size / 2, size / 2
+      );
+      grad.addColorStop(0, `rgba(${rgb[0]},${rgb[1]},${rgb[2]},1)`);
+      grad.addColorStop(0.45, `rgba(${rgb[0]},${rgb[1]},${rgb[2]},0.5)`);
+      grad.addColorStop(1, `rgba(${rgb[0]},${rgb[1]},${rgb[2]},0)`);
+      sctx.fillStyle = grad;
+      sctx.fillRect(0, 0, size, size);
+      return stamp;
+    };
+    const armStamps = waterRgb.map(makeStamp);
+    const whiteStamp = makeStamp([255, 255, 255]);
+
+    // A static bed of soft patches, made once and carved out of the water every
+    // redraw. Without it a disc this wide reads as one smooth lit plate; the
+    // carving costs a single drawImage and never animates, so it adds detail for
+    // free.
+    const mottleCanvas = document.createElement('canvas');
+    mottleCanvas.width = 384;
+    mottleCanvas.height = 384;
+    {
+      const mctx = mottleCanvas.getContext('2d');
+      mctx.fillStyle = '#000';
+      mctx.fillRect(0, 0, 384, 384);
+      for (let i = 0; i < 150; i++) {
+        const a = Math.random() * Math.PI * 2;
+        const rr = Math.sqrt(Math.random()) * 0.96 * 192;
+        const mx = 192 + Math.cos(a) * rr;
+        const my = 192 + Math.sin(a) * rr;
+        const mr = 12 + Math.random() * 46;
+        const g = mctx.createRadialGradient(mx, my, 0, mx, my, mr);
+        g.addColorStop(0, `rgba(255,255,255,${(0.16 + Math.random() * 0.26).toFixed(3)})`);
+        g.addColorStop(1, 'rgba(255,255,255,0)');
+        mctx.fillStyle = g;
+        mctx.beginPath();
+        mctx.arc(mx, my, mr, 0, Math.PI * 2);
+        mctx.fill();
+      }
+    }
+
+    // Fine caustic threads, drawn once and rotated slowly on top of the surface.
+    // Soft blobs alone turn into a featureless wash when the disc fills the hole;
+    // one drawImage of this gives the near water readable texture.
+    const causticSize = 384;
+    const caustics = document.createElement('canvas');
+    caustics.width = causticSize;
+    caustics.height = causticSize;
+    {
+      const cctx = caustics.getContext('2d');
+      // Blurred once here: doing it per redraw is what made the pool expensive,
+      // doing it at build time costs nothing at runtime.
+      cctx.filter = 'blur(1.6px)';
+      for (let i = 0; i < 210; i++) {
+        const a = Math.random() * Math.PI * 2;
+        const rr = Math.sqrt(Math.random()) * 0.95 * (causticSize / 2);
+        const x = causticSize / 2 + Math.cos(a) * rr;
+        const y = causticSize / 2 + Math.sin(a) * rr;
+        const cr = 4 + Math.random() * 13;
+        const start = Math.random() * Math.PI * 2;
+        cctx.strokeStyle = `rgba(255,255,255,${(0.1 + Math.random() * 0.2).toFixed(3)})`;
+        cctx.lineWidth = 0.9 + Math.random() * 1.6;
+        cctx.beginPath();
+        cctx.arc(x, y, cr, start, start + 1.1 + Math.random() * 2.0);
+        cctx.stroke();
+      }
+      cctx.filter = 'none';
+    }
+
+    // 384px over a 39.5-unit disc is the same density the smaller 320px pool had,
+    // so filling the hole costs no sharpness. No mipmaps and a 10Hz upload keep it
+    // cheap; every extra pixel is paid for on each redraw and each upload.
+    const waterCanvas = document.createElement('canvas');
+    const SIZE = 384;
+    waterCanvas.width = SIZE;
+    waterCanvas.height = SIZE;
+
+    const drawWater = (t) => {
+      const ctx = waterCanvas.getContext('2d');
+      const wcx = SIZE / 2;
+      const wcy = SIZE / 2;
+      const wr = wcx;
+
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.globalCompositeOperation = 'source-over';
+      ctx.clearRect(0, 0, SIZE, SIZE);
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(wcx, wcy, wr, 0, Math.PI * 2);
+      ctx.clip();
+
+      // Deep water. Everything above this is added light, so a dark base is what
+      // keeps five colours reading as five colours instead of one pastel plate.
+      ctx.fillStyle = 'rgba(8, 5, 20, 1)';
+      ctx.fillRect(0, 0, SIZE, SIZE);
+
+      ctx.globalCompositeOperation = 'lighter';
+      const count = waterRgb.length;
+      waterRgb.forEach((rgb, i) => {
+        const angle = (i / count) * Math.PI * 2 + t * 0.13 + Math.sin(t * 0.7 + i) * 0.18;
+        // Each blob drifts in and out from the axis like a slow eddy.
+        const dist = wr * (0.36 + 0.06 * Math.sin(t * 0.9 + i * 2.1));
+        const bx = wcx + Math.cos(angle) * dist;
+        const by = wcy + Math.sin(angle) * dist;
+        const blobR = wr * (0.39 + 0.03 * Math.sin(t * 1.3 + i));
+        const g = ctx.createRadialGradient(bx, by, 0, bx, by, blobR);
+        g.addColorStop(0, `rgba(${rgb[0]},${rgb[1]},${rgb[2]},0.34)`);
+        g.addColorStop(0.45, `rgba(${rgb[0]},${rgb[1]},${rgb[2]},0.14)`);
+        g.addColorStop(1, `rgba(${rgb[0]},${rgb[1]},${rgb[2]},0)`);
+        ctx.fillStyle = g;
+        ctx.fillRect(0, 0, SIZE, SIZE);
+      });
+
+      // Spiral arms: the surface turns the same way the column above it climbs,
+      // so the two read as one body of moving water. Stamped, not filled.
+      for (let arm = 0; arm < count; arm++) {
+        const stamp = armStamps[arm];
+        const baseAngle = (arm / count) * Math.PI * 2 + t * 0.17;
+        for (let s = 1; s <= 26; s++) {
+          const f = s / 26;
+          const r = wr * (0.08 + f * 0.86);
+          const a = baseAngle + f * 1.9;
+          const dotR = wr * (0.05 + 0.04 * (1 - f));
+          // The soft root keeps the outer streaks visible; a linear ramp left the
+          // edge of the pool bare once the disc grew to fill the hole.
+          const alpha = 0.17 * Math.pow(1 - f, 0.55) * (0.5 + 0.5 * Math.sin(t * 1.2 - s * 0.3 + arm));
+          if (alpha <= 0.004) continue;
+          ctx.globalAlpha = alpha;
+          ctx.drawImage(
+            stamp,
+            wcx + Math.cos(a) * r - dotR,
+            wcy + Math.sin(a) * r - dotR,
+            dotR * 2,
+            dotR * 2
+          );
+        }
+      }
+      ctx.globalAlpha = 1;
+
+      // Two thin rings travelling out from under the column, so the surface still
+      // reads as water and not only as a pattern.
+      for (let k = 0; k < 3; k++) {
+        const phase = (t * 0.13 + k / 3) % 1;
+        const ringR = wr * (0.1 + phase * 0.86);
+        const fade = Math.sin(Math.PI * phase) * (1 - phase * 0.5);
+        const band = wr * 0.028;
+        const ring = ctx.createRadialGradient(
+          wcx, wcy, Math.max(0, ringR - band), wcx, wcy, ringR + band
+        );
+        ring.addColorStop(0, 'rgba(190,170,255,0)');
+        ring.addColorStop(0.5, `rgba(200,180,255,${(0.09 * fade).toFixed(3)})`);
+        ring.addColorStop(1, 'rgba(190,170,255,0)');
+        ctx.fillStyle = ring;
+        ctx.fillRect(0, 0, SIZE, SIZE);
+      }
+
+      // Glints: a fixed spiral of points that catch the light as the surface turns.
+      for (let i = 0; i < 34; i++) {
+        const glint = Math.sin(t * 2.4 + i * 1.7);
+        if (glint <= 0.55) continue;
+        const a = (i * 2.399963) % (Math.PI * 2);
+        const rr = Math.sqrt((i + 0.5) / 34) * 0.86;
+        const sx = wcx + Math.cos(a) * rr * wr;
+        const sy = wcy + Math.sin(a) * rr * wr;
+        const alpha = (glint - 0.55) * 1.1;
+        const sr = 1.6 + 1.5 * (1 - rr);
+        ctx.globalAlpha = alpha * 0.5;
+        ctx.drawImage(whiteStamp, sx - sr, sy - sr, sr * 2, sr * 2);
+      }
+      ctx.globalAlpha = 1;
+
+      // Caustics, turning with the current.
+      ctx.globalAlpha = 0.18;
+      ctx.save();
+      ctx.translate(wcx, wcy);
+      ctx.rotate(t * 0.03);
+      ctx.drawImage(caustics, -wr, -wr);
+      ctx.restore();
+      ctx.globalAlpha = 1;
+
+      // Carve the static mottle: depth without any per-frame work.
+      ctx.globalCompositeOperation = 'destination-out';
+      ctx.globalAlpha = 0.1;
+      ctx.drawImage(mottleCanvas, 0, 0);
+      ctx.globalAlpha = 1;
+      ctx.globalCompositeOperation = 'lighter';
+
+      // Light from the column, pooling on the surface directly under it.
+      const pool = ctx.createRadialGradient(wcx, wcy, 0, wcx, wcy, wr * 0.3);
+      pool.addColorStop(0, `rgba(255,255,255,${(0.045 + 0.02 * Math.sin(t * 2.0)).toFixed(3)})`);
+      pool.addColorStop(1, 'rgba(255,255,255,0)');
+      ctx.fillStyle = pool;
+      ctx.fillRect(0, 0, SIZE, SIZE);
+
+      // Edge: brush the alpha away rather than painting darkness into it. Under
+      // additive blending a dark rim adds a little light instead of hiding it, so
+      // the surface used to stop on a hard ellipse; fading alpha dissolves it
+      // into the dark band between the pool and the amber hole edge.
+      ctx.globalCompositeOperation = 'destination-out';
+      const edge = ctx.createRadialGradient(wcx, wcy, wr * 0.86, wcx, wcy, wr);
+      edge.addColorStop(0, 'rgba(0,0,0,0)');
+      edge.addColorStop(0.6, 'rgba(0,0,0,0.35)');
+      edge.addColorStop(1, 'rgba(0,0,0,1)');
+      ctx.fillStyle = edge;
+      ctx.fillRect(0, 0, SIZE, SIZE);
+
+      ctx.restore();
+    };
+
+    drawWater(0);
+
+    const waterTexture = new THREE.CanvasTexture(waterCanvas);
+    // No mip chain and plain linear filtering: every canvas upload otherwise
+    // rebuilds the whole chain, and a soft additive glow does not need it.
+    waterTexture.generateMipmaps = false;
+    waterTexture.minFilter = THREE.LinearFilter;
+    waterTexture.anisotropy = 1;
+    const water = new THREE.Mesh(
+      new THREE.CircleGeometry(radius, 64),
+      new THREE.MeshBasicMaterial({
+        map: waterTexture,
+        side: THREE.DoubleSide,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending
+      })
+    );
+    water.rotation.x = -Math.PI / 2;
+    water.position.set(cx, surfaceY, cz);
+    water.renderOrder = 1; // under the cyclone, which draws at 2
+    this.scene.add(water);
+
+    this.floorFountain = {
+      center: new THREE.Vector3(cx, surfaceY, cz),
+      meshes: [bottom, water],
+      waterCanvas,
+      waterTexture,
+      drawWater
+    };
+  }
 
   /**
    * Create nebula/galaxy texture for floor - darker and seamless
@@ -1751,11 +2167,22 @@ export class DetailView {
     if (this.shell) this.shell.dispose();
     this.memoryOrbs = [];
     this.shell = new MemoryShell({
-      halfWidth: 72,        // straight-wall distance from the centre line
+      halfWidth: 50,        // straight-wall distance from the centre line: pulled in
+                            // from 72 so the corridor shelves sit close to the walkway;
+                            // the round room keeps its own radius below
       endRadius: 88,        // round end: ring floor radius is 60, so the wall keeps 28 units of air
-      flare: 20,            // smooth swing from the corridor walls out into the round room
-      zOpen: 100,           // open front, behind the entrance
-      zEnd: -222,           // round end centred on the ring centre (z = -150)
+      // A long, early swing out into the round room. At 20 the curve began within
+      // a couple of units of the ring entrance and crowded its orbs; 30 starts it
+      // ~26 units further back along the corridor and spreads the turn out.
+      flare: 30,
+      // The shell closes at z 100, 55 units behind the spawn, so turning round
+      // shows an end wall of shelves instead of open sky. Pulling it in to 56 put
+      // the spawn nose-to-shelf: at 8 units the frame is one row of planks.
+      zOpen: 100,
+      // zEnd is measured from the wall offset (zc = zEnd + halfWidth), so it has
+      // to move with halfWidth: -200 keeps the round room centred on the ring
+      // centre at z -150, which the flare start is derived from.
+      zEnd: -200,
       shelfColor: 0xf79c00
     });
     this.scene.add(this.shell.group);
@@ -2841,6 +3268,27 @@ export class DetailView {
         }
       });
       this.doorParticles = null;
+    }
+
+    // Remove the fountain basin in the floor hole.
+    if (this.floorFountain) {
+      const materials = new Set();
+      this.floorFountain.meshes.forEach(mesh => {
+        this.scene.remove(mesh);
+        if (mesh.geometry) mesh.geometry.dispose();
+        if (mesh.material) materials.add(mesh.material);
+      });
+      materials.forEach(material => material.dispose());
+      this.floorFountain.waterTexture.dispose();
+      this.floorFountain = null;
+    }
+
+    // Remove the floor hole's cyclone.
+    if (this.cyclone) {
+      this.scene.remove(this.cyclone.points);
+      this.cyclone.geometry.dispose();
+      this.cyclone.material.dispose();
+      this.cyclone = null;
     }
 
     // Remove old orbs
@@ -4470,6 +4918,22 @@ export class DetailView {
         edge.material.opacity = intensity;
       });
     }
+
+    // Water drift. The redraw is only worth paying for when the pool is close
+    // enough to show detail: from across the hall it is a sliver of glow, and
+    // skipping it there costs nothing but keeps the texture upload off the frame.
+    if (this.floorFountain && frameCount % 6 === 0) {
+      const fountain = this.floorFountain;
+      const dx = this.camera.position.x - fountain.center.x;
+      const dz = this.camera.position.z - fountain.center.z;
+      if (dx * dx + dz * dz < 90 * 90 && this.frustum.containsPoint(fountain.center)) {
+        fountain.drawWater(this.time);
+        fountain.waterTexture.needsUpdate = true;
+      }
+    }
+
+    // The cyclone is entirely GPU-driven; only its clock moves.
+    if (this.cyclone) this.cyclone.material.uniforms.uTime.value = this.time;
 
     // Animate memory orbs with frustum culling - only update visible orbs
     this.orbs.forEach((orb, index) => {

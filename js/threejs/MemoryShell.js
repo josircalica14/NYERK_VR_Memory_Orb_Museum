@@ -84,7 +84,8 @@ function rng(seed) { // mulberry32
 export class MemoryShell {
   constructor({ halfWidth = 90, zOpen = 100, zEnd = -230, rows = 11, rowH = 7.5, yBase = 2,
                 spacing = 6.0, seed = 7, palette = PALETTE, shelfColor = 0xf79c00, backLayer = false,
-                orbBright = 0.88, shelfGlow = 0.74, endRadius = halfWidth, flare = 20 } = {}) {
+                orbBright = 0.88, shelfGlow = 0.74, endRadius = halfWidth, flare = 20,
+                cornerRadius = 32 } = {}) {
     this.group = new THREE.Group();
     this.uniforms = { uTime: { value: 0 }, uH: { value: 1 }, uGrazing: { value: new THREE.Vector3(0.12, 0.6, 0.16) } };
     this.zc = zEnd + halfWidth;
@@ -103,7 +104,15 @@ export class MemoryShell {
     this.straightLen = zOpen - this.fz;
     this.filletLen = this.f * -this.aEnd;
     this.arcLen = this.R * (3 * Math.PI - 2 * this.thetaL);
-    this.L = 2 * this.straightLen + 2 * this.filletLen + this.arcLen;
+    // The end wall behind the spawn closes the loop: without it the two straight
+    // walls stop at zOpen and the hall opens onto the sky at the player's back.
+    // Each end of it is turned by a quarter-circle fillet, so the hall does not
+    // close on two hard 90 degree mitres.
+    this.cornerR = Math.min(cornerRadius, this.W * 0.5);
+    this.cornerLen = Math.PI * 0.5 * this.cornerR;
+    this.wallLen = this.straightLen - this.cornerR;
+    this.backLen = 2 * (this.W - this.cornerR);
+    this.L = 2 * this.wallLen + 2 * this.cornerLen + 2 * this.filletLen + this.arcLen + this.backLen;
     Object.assign(this, { zOpen, rows, rowH, yBase, spacing, palette, shelfGlow });
     this.H = yBase + (rows + 1) * rowH;
     this.uniforms.uH.value = this.H;
@@ -116,12 +125,14 @@ export class MemoryShell {
   }
 
   // Point + inward normal at arc-length s: left wall -> left fillet -> round room
-  // -> right fillet -> right wall.
+  // -> right fillet -> right wall -> end wall, so the loop closes.
   _sample(s) {
-    const { W, R, f, zOpen, zc, fx, fz, aEnd, thetaL, straightLen, filletLen, arcLen } = this;
+    const { W, R, f, zOpen, zc, fx, fz, aEnd, thetaL, filletLen, arcLen } = this;
+    const { cornerR, cornerLen, wallLen, backLen } = this;
     s = ((s % this.L) + this.L) % this.L;
-    if (s < straightLen) return { x: -W, z: zOpen - s, nx: 1, nz: 0 };
-    s -= straightLen;
+    // Left wall, from just behind the end wall's corner down to the neck flare.
+    if (s < wallLen) return { x: -W, z: zOpen - cornerR - s, nx: 1, nz: 0 };
+    s -= wallLen;
     if (s < filletLen) {
       const a = aEnd * (s / filletLen);
       return { x: -fx + f * Math.cos(a), z: fz + f * Math.sin(a), nx: Math.cos(a), nz: Math.sin(a) };
@@ -137,7 +148,27 @@ export class MemoryShell {
       return { x: fx - f * Math.cos(a), z: fz + f * Math.sin(a), nx: -Math.cos(a), nz: Math.sin(a) };
     }
     s -= filletLen;
-    return { x: W, z: fz + s, nx: -1, nz: 0 };
+    // Right wall, back up to the end wall's corner.
+    if (s < wallLen) return { x: W, z: fz + s, nx: -1, nz: 0 };
+    s -= wallLen;
+    // Quarter turn into the end wall, from the right wall round to (W - R, zOpen).
+    if (s < cornerLen) {
+      const th = Math.PI * 0.5 * (s / cornerLen);
+      const cx0 = W - cornerR, cz0 = zOpen - cornerR;
+      return { x: cx0 + cornerR * Math.cos(th), z: cz0 + cornerR * Math.sin(th),
+        nx: -Math.cos(th), nz: -Math.sin(th) };
+    }
+    s -= cornerLen;
+    // End wall, running between the two corner fillets. Its normal faces back into
+    // the hall, so orbs on it are lit like any other wall.
+    if (s < backLen) return { x: (W - cornerR) - s, z: zOpen, nx: 0, nz: -1 };
+    s -= backLen;
+    // Closing quarter turn, from the end wall back round onto the left wall:
+    // th runs pi/2 -> pi so the arc meets both walls travelling the same way.
+    const th = Math.PI * 0.5 * (1 + s / cornerLen);
+    const cx0 = -W + cornerR, cz0 = zOpen - cornerR;
+    return { x: cx0 + cornerR * Math.cos(th), z: cz0 + cornerR * Math.sin(th),
+      nx: -Math.cos(th), nz: -Math.sin(th) };
   }
 
   _orbLayer({ offset, spacing, yShift, size, bright, empty }) {
